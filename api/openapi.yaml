@@ -1,0 +1,2411 @@
+openapi: 3.0.3
+info:
+  title: AgentCore Risk Assessor API
+  description: |
+    REST API for automated design document review using AI agents with project management and chat capabilities.
+    
+    ## Features
+    - **Project Management**: Create and manage document review projects
+    - **Document Upload**: Secure S3 pre-signed URL upload
+    - **AI Review**: Comprehensive analysis across three dimensions:
+      - Architecture Review: Design patterns, scalability, maintainability
+      - Security Review: Security vulnerabilities and compliance
+      - Risk Assessment: Technical and business risks
+    - **Interactive Chat**: Ask follow-up questions to each review agent
+    
+    ## Workflow
+    1. Create a project → Get pre-signed S3 upload URL
+    2. Upload document to S3 using pre-signed URL
+    3. Trigger review → AI planner designs a review strategy, then specialized agents execute it
+    4. View findings organized by agent
+    5. Chat with agents for clarifications and recommendations
+    
+  version: 2.0.0
+  contact:
+    name: API Support
+    email: support@example.com
+
+servers:
+  - url: https://{api_id}.execute-api.{region}.amazonaws.com/{stage}
+    description: API Gateway HTTP API
+    variables:
+      api_id:
+        default: placeholder
+        description: API Gateway ID (set by Terraform)
+      region:
+        default: us-west-2
+        description: AWS Region
+      stage:
+        default: v1
+        description: API Stage
+
+tags:
+  - name: projects
+    description: Project management operations
+  - name: contexts
+    description: Organizational context document management
+  - name: benchmarks
+    description: Comparative analysis benchmarks
+  - name: reviews
+    description: Document review operations
+  - name: health
+    description: Health check
+
+paths:
+  /projects:
+    post:
+      tags:
+        - projects
+      summary: Create a new project
+      description: |
+        Creates a new project and returns a pre-signed S3 URL for document upload.
+        The pre-signed URL is valid for 15 minutes.
+      operationId: createProject
+      x-amazon-apigateway-integration:
+        type: aws_proxy
+        httpMethod: POST
+        uri: ${lambda_invoke_arn}
+        payloadFormatVersion: "2.0"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateProjectRequest'
+            examples:
+              basic:
+                summary: Create project
+                value:
+                  name: "Payment System Design"
+                  description: "Design review for new payment processing system"
+      responses:
+        '201':
+          description: Project created successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateProjectResponse'
+              examples:
+                success:
+                  summary: Project created
+                  value:
+                    project_id: "abc123"
+                    name: "Payment System Design"
+                    status: "pending"
+                    upload_urls:
+                      - filename: "design-doc.pdf"
+                        upload_url: "https://s3.amazonaws.com/bucket/projects/abc123/files/design-doc.pdf?X-Amz-..."
+                    upload_expires_at: "2024-03-05T10:15:00Z"
+                    created_at: "2024-03-05T10:00:00Z"
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    
+    get:
+      tags:
+        - projects
+      summary: List all projects
+      description: Returns a list of all projects, sorted by creation date (newest first)
+      operationId: listProjects
+      x-amazon-apigateway-integration:
+        type: aws_proxy
+        httpMethod: POST
+        uri: ${lambda_invoke_arn}
+        payloadFormatVersion: "2.0"
+      parameters:
+        - name: status
+          in: query
+          description: Filter by project status
+          schema:
+            type: string
+            enum: [pending, in_progress, completed, failed]
+        - name: limit
+          in: query
+          description: Maximum number of results
+          schema:
+            type: integer
+            default: 50
+            minimum: 1
+            maximum: 100
+      responses:
+        '200':
+          description: List of projects
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProjectListResponse'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /projects/{project_id}:
+    get:
+      tags:
+        - projects
+      summary: Get project details
+      description: Returns project metadata, latest review results, and chat history
+      operationId: getProject
+      x-amazon-apigateway-integration:
+        type: aws_proxy
+        httpMethod: POST
+        uri: ${lambda_invoke_arn}
+        payloadFormatVersion: "2.0"
+      parameters:
+        - $ref: '#/components/parameters/ProjectId'
+      responses:
+        '200':
+          description: Project details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProjectResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+    delete:
+      tags:
+        - projects
+      summary: Delete a project
+      description: |
+        Deletes a project and all associated data including reviews, chat history,
+        and the uploaded design document from S3.
+      operationId: deleteProject
+      x-amazon-apigateway-integration:
+        type: aws_proxy
+        httpMethod: POST
+        uri: ${lambda_invoke_arn}
+        payloadFormatVersion: "2.0"
+      parameters:
+        - $ref: '#/components/parameters/ProjectId'
+      responses:
+        '200':
+          description: Project deleted successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  project_id:
+                    type: string
+                  items_deleted:
+                    type: integer
+                  document_deleted:
+                    type: boolean
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /projects/{project_id}/document:
+    get:
+      tags:
+        - projects
+      summary: Get uploaded document content
+      description: Returns the text content of the design document uploaded for this project.
+      operationId: getProjectDocument
+      x-amazon-apigateway-integration:
+        type: aws_proxy
+        httpMethod: POST
+        uri: ${lambda_invoke_arn}
+        payloadFormatVersion: "2.0"
+      parameters:
+        - $ref: '#/components/parameters/ProjectId'
+      responses:
+        '200':
+          description: Document content
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  project_id:
+                    type: string
+                  content:
+                    type: string
+                  s3_key:
+                    type: string
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /projects/{project_id}/feedback:
+    post:
+      tags:
+        - projects
+      summary: Submit feedback on a finding
+      description: Submit thumbs up/down feedback on an individual finding. Per-user — each user can rate each finding independently.
+      operationId: submitFeedback
+      x-amazon-apigateway-integration:
+        type: aws_proxy
+        httpMethod: POST
+        uri: ${lambda_invoke_arn}
+        payloadFormatVersion: "2.0"
+      parameters:
+        - $ref: '#/components/parameters/ProjectId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - finding_id
+                - agent_type
+                - value
+              properties:
+                finding_id:
+                  type: string
+                  description: Finding identifier
+                  example: "ARCH-001"
+                agent_type:
+                  type: string
+                  description: Agent type
+                  example: "architecture"
+                value:
+                  type: string
+                  enum: [up, down]
+                  description: Feedback value
+                  example: "up"
+      responses:
+        '201':
+          description: Feedback submitted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  finding_id:
+                    type: string
+                  agent_type:
+                    type: string
+                  value:
+                    type: string
+                  timestamp:
+                    type: string
+                    format: date-time
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+    get:
+      tags:
+        - projects
+      summary: Get all feedback for a project
+      description: Returns all user feedback for a project's findings.
+      operationId: getProjectFeedback
+      x-amazon-apigateway-integration:
+        type: aws_proxy
+        httpMethod: POST
+        uri: ${lambda_invoke_arn}
+        payloadFormatVersion: "2.0"
+      parameters:
+        - $ref: '#/components/parameters/ProjectId'
+      responses:
+        '200':
+          description: Project feedback
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  feedback:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        finding_id:
+                          type: string
+                        agent_type:
+                          type: string
+                        value:
+                          type: string
+                          enum: [up, down]
+                        user:
+                          type: string
+                        timestamp:
+                          type: string
+                          format: date-time
+                  count:
+                    type: integer
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /projects/{project_id}/review:
+    post:
+      tags:
+        - reviews
+      summary: Trigger document review
+      description: |
+        Initiates a comprehensive review of the uploaded document.
+        The AI planner analyzes the document and produces a review plan,
+        which is then executed by specialized agents.
+        Document must be uploaded to S3 before triggering review.
+      operationId: triggerReview
+      x-amazon-apigateway-integration:
+        type: aws_proxy
+        httpMethod: POST
+        uri: ${lambda_invoke_arn}
+        payloadFormatVersion: "2.0"
+      parameters:
+        - $ref: '#/components/parameters/ProjectId'
+      responses:
+        '200':
+          description: Review completed successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReviewResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /projects/{project_id}/reviews/{review_id}/plan:
+    get:
+      tags:
+        - reviews
+      summary: Get review plan
+      description: |
+        Returns the stored review plan for a given review. Use review_id='latest'
+        to get the most recent plan. Used for page refresh recovery during the
+        plan approval window.
+      operationId: getReviewPlan
+      x-amazon-apigateway-integration:
+        type: aws_proxy
+        httpMethod: POST
+        uri: ${lambda_invoke_arn}
+        payloadFormatVersion: "2.0"
+      parameters:
+        - $ref: '#/components/parameters/ProjectId'
+        - $ref: '#/components/parameters/ReviewId'
+      responses:
+        '200':
+          description: Review plan
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReviewPlan'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /projects/{project_id}/reviews/{review_id}/approve:
+    post:
+      tags:
+        - reviews
+      summary: Approve review plan
+      description: |
+        Approves a pending review plan, resuming the Step Functions execution.
+        Optionally accepts a modified plan in the request body.
+      operationId: approveReviewPlan
+      x-amazon-apigateway-integration:
+        type: aws_proxy
+        httpMethod: POST
+        uri: ${lambda_invoke_arn}
+        payloadFormatVersion: "2.0"
+      parameters:
+        - $ref: '#/components/parameters/ProjectId'
+        - $ref: '#/components/parameters/ReviewId'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                plan:
+                  $ref: '#/components/schemas/ReviewPlan'
+                  description: Optional modified plan. If omitted, the original AI plan is used.
+      responses:
+        '200':
+          description: Plan approved
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: "approved"
+                  review_id:
+                    type: string
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Plan already approved or rejected
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /projects/{project_id}/reviews/{review_id}/reject:
+    post:
+      tags:
+        - reviews
+      summary: Reject review plan
+      description: |
+        Rejects a pending review plan, failing the Step Functions execution.
+        The project status returns to its pre-review state.
+      operationId: rejectReviewPlan
+      x-amazon-apigateway-integration:
+        type: aws_proxy
+        httpMethod: POST
+        uri: ${lambda_invoke_arn}
+        payloadFormatVersion: "2.0"
+      parameters:
+        - $ref: '#/components/parameters/ProjectId'
+        - $ref: '#/components/parameters/ReviewId'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason:
+                  type: string
+                  description: Optional rejection reason
+      responses:
+        '200':
+          description: Plan rejected
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: "rejected"
+                  review_id:
+                    type: string
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /projects/{project_id}/reviews/{review_id}/abort:
+    post:
+      tags:
+        - reviews
+      summary: Abort a running review
+      description: |
+        Stops a running review by terminating the Step Functions execution.
+        The project status is set to failed. Only works when the project
+        status is in_progress.
+      operationId: abortReview
+      x-amazon-apigateway-integration:
+        type: aws_proxy
+        httpMethod: POST
+        uri: ${lambda_invoke_arn}
+        payloadFormatVersion: "2.0"
+      parameters:
+        - $ref: '#/components/parameters/ProjectId'
+        - $ref: '#/components/parameters/ReviewId'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason:
+                  type: string
+                  description: Optional abort reason
+      responses:
+        '200':
+          description: Review aborted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: "aborted"
+                  review_id:
+                    type: string
+                  project_id:
+                    type: string
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /projects/{project_id}/reviews/{review_id}/events:
+    get:
+      tags:
+        - reviews
+      summary: Get review event log
+      description: |
+        Returns the persisted progress events for a review. Events are recorded
+        during workflow execution and can be replayed to reconstruct the full
+        UI state (flow graph, event timeline, agent metrics) after a page refresh.
+        Use review_id='latest' to get events for the most recent review.
+      operationId: getReviewEvents
+      x-amazon-apigateway-integration:
+        type: aws_proxy
+        httpMethod: POST
+        uri: ${lambda_invoke_arn}
+        payloadFormatVersion: "2.0"
+      parameters:
+        - $ref: '#/components/parameters/ProjectId'
+        - $ref: '#/components/parameters/ReviewId'
+      responses:
+        '200':
+          description: Review event log
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  review_id:
+                    type: string
+                  events:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        event:
+                          type: string
+                          description: Event type (e.g. agent_started, plan_created)
+                        detail:
+                          type: object
+                          description: Event-specific payload
+                        ts:
+                          type: string
+                          format: date-time
+                          description: ISO 8601 timestamp
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /projects/{project_id}/report:
+    get:
+      tags:
+        - reviews
+      summary: Generate markdown report
+      description: |
+        Generates a markdown report from the latest completed review's findings.
+        The report is rendered on-demand from the post quality-merge findings
+        payload in S3, so it always reflects the latest data. Includes an
+        executive summary, per-agent findings sorted by severity with
+        domain-specific enrichment, and a consolidated action items table.
+      operationId: getReport
+      x-amazon-apigateway-integration:
+        type: aws_proxy
+        httpMethod: POST
+        uri: ${lambda_invoke_arn}
+        payloadFormatVersion: "2.0"
+      parameters:
+        - $ref: '#/components/parameters/ProjectId'
+      responses:
+        '200':
+          description: Markdown report generated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  report:
+                    type: string
+                    description: Complete markdown report
+                  content_type:
+                    type: string
+                    example: "text/markdown"
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /benchmarks:
+    post:
+      tags:
+        - benchmarks
+      summary: Create a benchmark definition
+      description: |
+        Creates a new benchmark that compares multiple model/prompt configurations
+        against the same document. Use POST /benchmarks/{id}/run to execute.
+      operationId: createBenchmark
+      x-amazon-apigateway-integration:
+        type: aws_proxy
+        httpMethod: POST
+        uri: ${lambda_invoke_arn}
+        payloadFormatVersion: "2.0"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateBenchmarkRequest'
+      responses:
+        '201':
+          description: Benchmark created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BenchmarkResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+    get:
+      tags:
+        - benchmarks
+      summary: List benchmarks
+      description: Returns all benchmark definitions, newest first.
+      operationId: listBenchmarks
+      x-amazon-apigateway-integration:
+        type: aws_proxy
+        httpMethod: POST
+        uri: ${lambda_invoke_arn}
+        payloadFormatVersion: "2.0"
+      responses:
+        '200':
+          description: List of benchmarks
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  benchmarks:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/BenchmarkSummary'
+                  count:
+                    type: integer
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /benchmarks/{benchmark_id}:
+    get:
+      tags:
+        - benchmarks
+      summary: Get benchmark with run results
+      description: Returns the benchmark definition and all run results.
+      operationId: getBenchmark
+      x-amazon-apigateway-integration:
+        type: aws_proxy
+        httpMethod: POST
+        uri: ${lambda_invoke_arn}
+        payloadFormatVersion: "2.0"
+      parameters:
+        - $ref: '#/components/parameters/BenchmarkId'
+      responses:
+        '200':
+          description: Benchmark with runs
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BenchmarkDetailResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+    delete:
+      tags:
+        - benchmarks
+      summary: Delete benchmark and results
+      description: Deletes the benchmark definition and all associated run results.
+      operationId: deleteBenchmark
+      x-amazon-apigateway-integration:
+        type: aws_proxy
+        httpMethod: POST
+        uri: ${lambda_invoke_arn}
+        payloadFormatVersion: "2.0"
+      parameters:
+        - $ref: '#/components/parameters/BenchmarkId'
+      responses:
+        '200':
+          description: Benchmark deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  benchmark_id:
+                    type: string
+                  deleted:
+                    type: boolean
+                  items_deleted:
+                    type: integer
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /benchmarks/{benchmark_id}/run:
+    post:
+      tags:
+        - benchmarks
+      summary: Execute benchmark
+      description: |
+        Triggers execution of all configurations in parallel. Each configuration
+        invokes the review agent and judge evaluator, storing results as run records.
+        Returns immediately with 202 — execution is asynchronous.
+      operationId: runBenchmark
+      x-amazon-apigateway-integration:
+        type: aws_proxy
+        httpMethod: POST
+        uri: ${lambda_invoke_arn}
+        payloadFormatVersion: "2.0"
+      parameters:
+        - $ref: '#/components/parameters/BenchmarkId'
+      responses:
+        '202':
+          description: Benchmark execution started
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  benchmark_id:
+                    type: string
+                  status:
+                    type: string
+                    example: "running"
+                  configurations_count:
+                    type: integer
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /analytics/summary:
+    get:
+      tags:
+        - analytics
+      summary: Get analytics summary
+      description: Aggregated quality scores, feedback rates, and recent review stats across all completed reviews.
+      operationId: getAnalyticsSummary
+      x-amazon-apigateway-integration:
+        type: aws_proxy
+        httpMethod: POST
+        uri: ${lambda_invoke_arn}
+        payloadFormatVersion: "2.0"
+      responses:
+        '200':
+          description: Analytics summary
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  agent_scores:
+                    type: object
+                  feedback_summary:
+                    type: object
+                  review_count:
+                    type: integer
+                  recent_reviews:
+                    type: array
+                    items:
+                      type: object
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /analytics/trends:
+    get:
+      tags:
+        - analytics
+      summary: Get quality trends
+      description: Time series quality data filterable by agent and date range.
+      operationId: getAnalyticsTrends
+      x-amazon-apigateway-integration:
+        type: aws_proxy
+        httpMethod: POST
+        uri: ${lambda_invoke_arn}
+        payloadFormatVersion: "2.0"
+      parameters:
+        - name: agent
+          in: query
+          description: Filter by agent type
+          schema:
+            type: string
+        - name: limit
+          in: query
+          description: Max data points
+          schema:
+            type: integer
+            default: 30
+      responses:
+        '200':
+          description: Trend data points
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data_points:
+                    type: array
+                    items:
+                      type: object
+                  count:
+                    type: integer
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /analytics/coverage/{project_id}:
+    get:
+      tags:
+        - analytics
+      summary: Get coverage matrix
+      description: Coverage matrix showing findings by document section per agent for a specific review.
+      operationId: getAnalyticsCoverage
+      x-amazon-apigateway-integration:
+        type: aws_proxy
+        httpMethod: POST
+        uri: ${lambda_invoke_arn}
+        payloadFormatVersion: "2.0"
+      parameters:
+        - $ref: '#/components/parameters/ProjectId'
+      responses:
+        '200':
+          description: Coverage matrix data
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  matrix:
+                    type: object
+                  sections:
+                    type: array
+                    items:
+                      type: string
+                  agents:
+                    type: array
+                    items:
+                      type: string
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/registry:
+    get:
+      tags:
+        - admin
+      summary: List agent registry
+      description: Returns all agent registry entries with full configuration. Requires admin group membership.
+      operationId: listAdminRegistry
+      x-amazon-apigateway-integration:
+        type: aws_proxy
+        httpMethod: POST
+        uri: ${lambda_invoke_arn}
+        payloadFormatVersion: "2.0"
+      responses:
+        '200':
+          description: Agent registry entries
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  agents:
+                    type: array
+                    items:
+                      type: object
+        '403':
+          description: Admin access required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/registry/{agent_type}:
+    put:
+      tags:
+        - admin
+      summary: Update agent registry entry
+      description: Update an agent's registry configuration. Requires admin group membership.
+      operationId: updateAdminRegistry
+      x-amazon-apigateway-integration:
+        type: aws_proxy
+        httpMethod: POST
+        uri: ${lambda_invoke_arn}
+        payloadFormatVersion: "2.0"
+      parameters:
+        - name: agent_type
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                display_name:
+                  type: string
+                icon:
+                  type: string
+                color:
+                  type: string
+                sort_order:
+                  type: integer
+                enabled:
+                  type: boolean
+                finding_schema:
+                  type: string
+                judge_defaults:
+                  type: string
+                default_depth:
+                  type: string
+                  enum: [quick, standard, thorough]
+                  description: Overrides the AI planner's depth for this agent. Users can still customize per-review.
+      responses:
+        '200':
+          description: Updated agent entry
+          content:
+            application/json:
+              schema:
+                type: object
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          description: Admin access required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/guardrail-events:
+    get:
+      tags:
+        - admin
+      summary: List guardrail intervention events
+      description: |
+        Returns guardrail intervention events from the audit log. Supports
+        date range and project filtering. Requires admin group membership.
+      operationId: listGuardrailEvents
+      x-amazon-apigateway-integration:
+        type: aws_proxy
+        httpMethod: POST
+        uri: ${lambda_invoke_arn}
+        payloadFormatVersion: "2.0"
+      parameters:
+        - name: start_date
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+          description: ISO-8601 start date (inclusive). Defaults to 30 days ago.
+        - name: end_date
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+          description: ISO-8601 end date (inclusive). Defaults to now.
+        - name: project_id
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Filter events by project ID.
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 100
+            maximum: 500
+          description: Maximum number of events to return.
+      responses:
+        '200':
+          description: Guardrail intervention events
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  events:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        timestamp:
+                          type: string
+                          format: date-time
+                        project_id:
+                          type: string
+                        agent_type:
+                          type: string
+                        agent_role:
+                          type: string
+                          enum: [chat, review]
+                        action_taken:
+                          type: string
+                        user_sub:
+                          type: string
+                        user_email:
+                          type: string
+                        policy_triggered:
+                          type: string
+                  count:
+                    type: integer
+                  configured:
+                    type: boolean
+                    description: Whether the guardrail events table is configured.
+        '403':
+          description: Admin access required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/standards:
+    get:
+      tags:
+        - admin
+      summary: List standards corpus
+      description: |
+        Returns all documents in the standards S3 bucket with their metadata sidecars.
+        Requires admin group membership.
+      operationId: listAdminStandards
+      x-amazon-apigateway-integration:
+        type: aws_proxy
+        httpMethod: POST
+        uri: ${lambda_invoke_arn}
+        payloadFormatVersion: "2.0"
+      responses:
+        '200':
+          description: Standards corpus listing
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  standards:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        key:
+                          type: string
+                          description: S3 object key
+                          example: "cps-230/cps-230.md"
+                        standard_id:
+                          type: string
+                          description: Standard identifier derived from directory name
+                          example: "cps-230"
+                        source_type:
+                          type: string
+                          description: Standard source type from metadata sidecar
+                          example: "prudential_standard"
+                        size_bytes:
+                          type: integer
+                          description: File size in bytes
+                        last_modified:
+                          type: string
+                          format: date-time
+                          description: Last modified timestamp
+                        has_metadata:
+                          type: boolean
+                          description: Whether a metadata sidecar exists
+                  count:
+                    type: integer
+                  bucket:
+                    type: string
+                    description: Standards S3 bucket name
+        '403':
+          description: Admin access required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: Standards bucket not configured
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+    post:
+      tags:
+        - admin
+      summary: Upload a new standard
+      description: |
+        Validates inputs, writes the metadata sidecar to S3, and returns a pre-signed
+        URL for the caller to upload the content file. Supports any format accepted by
+        Bedrock KB (md, pdf, txt, html, doc, docx, csv). The file extension from the
+        filename is preserved in the S3 key. The sidecar is generated server-side to
+        guarantee it matches the Bedrock metadata schema. Requires admin group membership.
+      operationId: uploadAdminStandard
+      x-amazon-apigateway-integration:
+        type: aws_proxy
+        httpMethod: POST
+        uri: ${lambda_invoke_arn}
+        payloadFormatVersion: "2.0"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - standard_id
+                - source_type
+                - filename
+              properties:
+                standard_id:
+                  type: string
+                  description: Kebab-case identifier (e.g. cps-230)
+                  example: "cps-230"
+                  pattern: "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+                source_type:
+                  type: string
+                  description: Standard source type
+                  enum: [prudential_standard, prudential_guidance, regulatory_commentary, industry_framework, legislation]
+                  example: "prudential_standard"
+                jurisdiction:
+                  type: string
+                  description: Geographic/regulatory scope
+                  enum: [AU, EU, US, UK, international]
+                  example: "AU"
+                industry:
+                  type: string
+                  description: Sector applicability
+                  enum: [financial_services, general, automotive]
+                  example: "financial_services"
+                filename:
+                  type: string
+                  description: Original filename (extension determines S3 key suffix)
+                  example: "cps-230.pdf"
+                content_type:
+                  type: string
+                  description: MIME type for the upload
+                  default: "application/octet-stream"
+      responses:
+        '201':
+          description: Standard metadata written, upload URL returned
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  upload_url:
+                    type: string
+                    format: uri
+                    description: Pre-signed S3 URL for uploading the .md file
+                  s3_key:
+                    type: string
+                    description: S3 key where the file will be stored
+                    example: "cps-230/cps-230.md"
+                  metadata_written:
+                    type: boolean
+                    description: Whether the metadata sidecar was written
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          description: Admin access required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/standards/{standard_id}:
+    delete:
+      tags:
+        - admin
+      summary: Delete a standard
+      description: |
+        Deletes all objects under the standard's S3 prefix (the .md file and its
+        metadata sidecar). The document is removed from the KB on the next sync.
+        Requires admin group membership.
+      operationId: deleteAdminStandard
+      x-amazon-apigateway-integration:
+        type: aws_proxy
+        httpMethod: POST
+        uri: ${lambda_invoke_arn}
+        payloadFormatVersion: "2.0"
+      parameters:
+        - name: standard_id
+          in: path
+          required: true
+          description: Kebab-case standard identifier
+          schema:
+            type: string
+            example: "cps-230"
+      responses:
+        '200':
+          description: Standard deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  standard_id:
+                    type: string
+                  objects_deleted:
+                    type: integer
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          description: Admin access required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/standards/{standard_id}/metadata:
+    put:
+      tags:
+        - admin
+      summary: Edit standard metadata
+      description: |
+        Rewrites the metadata sidecar without touching the content file. Use to
+        correct source_type, add jurisdiction/industry tags, or update metadata
+        after initial upload. Discovers the actual content file under the standard's
+        prefix regardless of file extension. Requires admin group membership.
+      operationId: updateAdminStandardMetadata
+      x-amazon-apigateway-integration:
+        type: aws_proxy
+        httpMethod: POST
+        uri: ${lambda_invoke_arn}
+        payloadFormatVersion: "2.0"
+      parameters:
+        - name: standard_id
+          in: path
+          required: true
+          description: Kebab-case standard identifier
+          schema:
+            type: string
+            example: "cps-230"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - source_type
+              properties:
+                source_type:
+                  type: string
+                  enum: [prudential_standard, prudential_guidance, regulatory_commentary, industry_framework, legislation]
+                jurisdiction:
+                  type: string
+                  enum: [AU, EU, US, UK, international]
+                  description: Geographic/regulatory scope
+                industry:
+                  type: string
+                  enum: [financial_services, general, automotive]
+                  description: Sector applicability
+      responses:
+        '200':
+          description: Metadata updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  standard_id:
+                    type: string
+                  metadata_written:
+                    type: boolean
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          description: Admin access required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/standards/sync:
+    post:
+      tags:
+        - admin
+      summary: Trigger KB ingestion job
+      description: |
+        Starts a Bedrock Knowledge Base ingestion job to sync the standards
+        S3 bucket with the KB index. Requires admin group membership.
+      operationId: syncAdminStandards
+      x-amazon-apigateway-integration:
+        type: aws_proxy
+        httpMethod: POST
+        uri: ${lambda_invoke_arn}
+        payloadFormatVersion: "2.0"
+      responses:
+        '200':
+          description: Ingestion job started
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ingestion_job_id:
+                    type: string
+                  status:
+                    type: string
+                    example: "STARTING"
+        '403':
+          description: Admin access required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: Standards KB not configured
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/standards/sync-status:
+    get:
+      tags:
+        - admin
+      summary: Poll KB ingestion job status
+      description: |
+        Returns the status of the most recent Bedrock KB ingestion job,
+        including statistics when complete. Requires admin group membership.
+      operationId: getAdminStandardsSyncStatus
+      x-amazon-apigateway-integration:
+        type: aws_proxy
+        httpMethod: POST
+        uri: ${lambda_invoke_arn}
+        payloadFormatVersion: "2.0"
+      responses:
+        '200':
+          description: Latest ingestion job status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    enum: [NO_JOBS, STARTING, IN_PROGRESS, COMPLETE, FAILED]
+                  ingestion_job_id:
+                    type: string
+                    nullable: true
+                  started_at:
+                    type: string
+                    format: date-time
+                  completed_at:
+                    type: string
+                    format: date-time
+                  statistics:
+                    type: object
+                    nullable: true
+                    properties:
+                      documents_scanned:
+                        type: integer
+                      documents_indexed:
+                        type: integer
+                      documents_failed:
+                        type: integer
+        '403':
+          description: Admin access required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: Standards KB not configured
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /health:
+    get:
+      tags:
+        - health
+      summary: Health check
+      description: Returns API health status
+      operationId: healthCheck
+      security: []
+      x-amazon-apigateway-integration:
+        type: aws_proxy
+        httpMethod: POST
+        uri: ${lambda_invoke_arn}
+        payloadFormatVersion: "2.0"
+      responses:
+        '200':
+          description: API is healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: "healthy"
+                  timestamp:
+                    type: string
+                    format: date-time
+
+  /agents:
+    get:
+      tags:
+        - agents
+      summary: List available review agents
+      description: |
+        Returns the agent registry — all available review agent types with their
+        display metadata (name, icon, color, description) and capabilities.
+        Used by the frontend to dynamically render agent tabs, chat panels, and
+        the plan customize panel.
+      operationId: listAgents
+      x-amazon-apigateway-integration:
+        type: aws_proxy
+        httpMethod: POST
+        uri: ${lambda_invoke_arn}
+        payloadFormatVersion: "2.0"
+      responses:
+        '200':
+          description: List of available agents
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  agents:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        agent_type:
+                          type: string
+                          example: "architecture"
+                        display_name:
+                          type: string
+                          example: "Architecture"
+                        icon:
+                          type: string
+                          example: "🏗️"
+                        color:
+                          type: string
+                          example: "#00a8e8"
+                        description:
+                          type: string
+                          example: "Reviews software architecture, design patterns, scalability"
+                        category:
+                          type: string
+                          example: "technical"
+                        has_review_agent:
+                          type: boolean
+                        has_chat_agent:
+                          type: boolean
+                        has_judge_agent:
+                          type: boolean
+                        enabled:
+                          type: boolean
+                        sort_order:
+                          type: integer
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /models:
+    get:
+      tags:
+        - models
+      summary: List available Bedrock models
+      description: Returns foundation models available for benchmarking. Filtered to text-output, on-demand, active models.
+      operationId: listModels
+      x-amazon-apigateway-integration:
+        type: aws_proxy
+        httpMethod: POST
+        uri: ${lambda_invoke_arn}
+        payloadFormatVersion: "2.0"
+      responses:
+        '200':
+          description: List of available models
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  models:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        model_id:
+                          type: string
+                          example: "us.anthropic.claude-sonnet-4-20250514-v1:0"
+                        model_name:
+                          type: string
+                          example: "Claude Sonnet 4"
+                        provider_name:
+                          type: string
+                          example: "Anthropic"
+                        input_modalities:
+                          type: array
+                          items:
+                            type: string
+                        output_modalities:
+                          type: array
+                          items:
+                            type: string
+                  count:
+                    type: integer
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /contexts:
+    post:
+      tags:
+        - contexts
+      summary: Create a new context document
+      description: |
+        Creates a new organizational context document and returns a pre-signed S3 URL for upload.
+        Context documents describe business environment, regulatory requirements, and technology
+        standards. They are applied to project reviews so agents produce contextually relevant findings.
+      operationId: createContext
+      x-amazon-apigateway-integration:
+        type: aws_proxy
+        httpMethod: POST
+        uri: ${lambda_invoke_arn}
+        payloadFormatVersion: "2.0"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - name
+              properties:
+                name:
+                  type: string
+                  description: Context document name
+                  example: "ACME Corp - Financial Services"
+                description:
+                  type: string
+                  description: Brief description
+                  example: "PCI DSS compliant fintech environment"
+      responses:
+        '201':
+          description: Context created successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  context_id:
+                    type: string
+                  name:
+                    type: string
+                  upload_url:
+                    type: string
+                    format: uri
+                  upload_expires_at:
+                    type: string
+                    format: date-time
+                  created_at:
+                    type: string
+                    format: date-time
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+    get:
+      tags:
+        - contexts
+      summary: List all context documents
+      description: Returns all organizational context documents
+      operationId: listContexts
+      x-amazon-apigateway-integration:
+        type: aws_proxy
+        httpMethod: POST
+        uri: ${lambda_invoke_arn}
+        payloadFormatVersion: "2.0"
+      responses:
+        '200':
+          description: List of context documents
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  contexts:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        context_id:
+                          type: string
+                        name:
+                          type: string
+                        description:
+                          type: string
+                        created_at:
+                          type: string
+                          format: date-time
+                  count:
+                    type: integer
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /contexts/{context_id}:
+    get:
+      tags:
+        - contexts
+      summary: Get context document details
+      operationId: getContext
+      x-amazon-apigateway-integration:
+        type: aws_proxy
+        httpMethod: POST
+        uri: ${lambda_invoke_arn}
+        payloadFormatVersion: "2.0"
+      parameters:
+        - name: context_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Context document details
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  context_id:
+                    type: string
+                  name:
+                    type: string
+                  description:
+                    type: string
+                  created_at:
+                    type: string
+                    format: date-time
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+    delete:
+      tags:
+        - contexts
+      summary: Delete a context document
+      description: Deletes the context document and its S3 file. Projects referencing it will lose their context.
+      operationId: deleteContext
+      x-amazon-apigateway-integration:
+        type: aws_proxy
+        httpMethod: POST
+        uri: ${lambda_invoke_arn}
+        payloadFormatVersion: "2.0"
+      parameters:
+        - name: context_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Context deleted successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  context_id:
+                    type: string
+                  deleted:
+                    type: boolean
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /contexts/{context_id}/content:
+    get:
+      tags:
+        - contexts
+      summary: Get context document content
+      description: Returns the full text content of the context document from S3.
+      operationId: getContextContent
+      x-amazon-apigateway-integration:
+        type: aws_proxy
+        httpMethod: POST
+        uri: ${lambda_invoke_arn}
+        payloadFormatVersion: "2.0"
+      parameters:
+        - name: context_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Context document content
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  context_id:
+                    type: string
+                  content:
+                    type: string
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+    put:
+      tags:
+        - contexts
+      summary: Update context document content
+      description: Replaces the context document content in S3.
+      operationId: updateContextContent
+      x-amazon-apigateway-integration:
+        type: aws_proxy
+        httpMethod: POST
+        uri: ${lambda_invoke_arn}
+        payloadFormatVersion: "2.0"
+      parameters:
+        - name: context_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - content
+              properties:
+                content:
+                  type: string
+                  description: Updated markdown content
+      responses:
+        '200':
+          description: Content updated successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  context_id:
+                    type: string
+                  updated:
+                    type: boolean
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+components:
+  parameters:
+    ProjectId:
+      name: project_id
+      in: path
+      required: true
+      description: Unique project identifier
+      schema:
+        type: string
+        example: "abc123"
+
+    ReviewId:
+      name: review_id
+      in: path
+      required: true
+      description: Review identifier (or 'latest' for most recent)
+      schema:
+        type: string
+        example: "rev_abc123"
+
+    BenchmarkId:
+      name: benchmark_id
+      in: path
+      required: true
+      description: Unique benchmark identifier
+      schema:
+        type: string
+        example: "bench_a1b2c3d4"
+
+  schemas:
+    CreateProjectRequest:
+      type: object
+      required:
+        - name
+        - files
+      properties:
+        name:
+          type: string
+          description: Project name
+          example: "Payment System Design"
+          minLength: 1
+          maxLength: 200
+        description:
+          type: string
+          description: Project description (optional)
+          example: "Design review for new payment processing system"
+          maxLength: 1000
+        context_id:
+          type: string
+          description: Organizational context document ID (optional). Links the project to a context for tailored reviews.
+          example: "ctx_abc123"
+        files:
+          type: array
+          description: List of files to upload. At least one file is required.
+          minItems: 1
+          items:
+            type: object
+            required:
+              - filename
+            properties:
+              filename:
+                type: string
+                description: Original filename
+                example: "payment-system-design.pdf"
+
+    CreateProjectResponse:
+      type: object
+      properties:
+        project_id:
+          type: string
+          description: Unique project identifier
+          example: "abc123"
+        name:
+          type: string
+          example: "Payment System Design"
+        status:
+          type: string
+          enum: [pending]
+          example: "pending"
+        upload_urls:
+          type: array
+          description: Pre-signed S3 URLs for file upload (valid for 15 minutes)
+          items:
+            type: object
+            properties:
+              filename:
+                type: string
+              upload_url:
+                type: string
+                format: uri
+        upload_expires_at:
+          type: string
+          format: date-time
+          description: Upload URL expiration time
+          example: "2024-03-05T10:15:00Z"
+        created_at:
+          type: string
+          format: date-time
+          example: "2024-03-05T10:00:00Z"
+
+    ProjectListResponse:
+      type: object
+      properties:
+        projects:
+          type: array
+          items:
+            $ref: '#/components/schemas/ProjectSummary'
+        count:
+          type: integer
+          description: Number of projects returned
+          example: 10
+
+    ProjectSummary:
+      type: object
+      properties:
+        project_id:
+          type: string
+          example: "abc123"
+        name:
+          type: string
+          example: "Payment System Design"
+        status:
+          type: string
+          enum: [pending, in_progress, completed, failed]
+          example: "completed"
+        created_at:
+          type: string
+          format: date-time
+          example: "2024-03-05T10:00:00Z"
+        updated_at:
+          type: string
+          format: date-time
+          example: "2024-03-05T10:30:00Z"
+
+    ProjectResponse:
+      type: object
+      properties:
+        project_id:
+          type: string
+          example: "abc123"
+        name:
+          type: string
+          example: "Payment System Design"
+        description:
+          type: string
+          example: "Design review for new payment processing system"
+        status:
+          type: string
+          enum: [pending, in_progress, completed, failed]
+          example: "completed"
+        document:
+          type: object
+          properties:
+            s3_bucket:
+              type: string
+              example: "risk-assessor-design-docs-dev-123456789012"
+            s3_key:
+              type: string
+              example: "projects/abc123/document.pdf"
+            name:
+              type: string
+              example: "payment-system-design.pdf"
+            size:
+              type: integer
+              description: File size in bytes
+              example: 1048576
+        review:
+          $ref: '#/components/schemas/ReviewResult'
+        created_at:
+          type: string
+          format: date-time
+          example: "2024-03-05T10:00:00Z"
+        updated_at:
+          type: string
+          format: date-time
+          example: "2024-03-05T10:30:00Z"
+
+    ReviewResponse:
+      type: object
+      properties:
+        review_id:
+          type: string
+          format: uuid
+          example: "rev_xyz789"
+        project_id:
+          type: string
+          example: "abc123"
+        status:
+          type: string
+          enum: [completed, failed]
+          example: "completed"
+        result:
+          $ref: '#/components/schemas/ReviewResult'
+        created_at:
+          type: string
+          format: date-time
+          example: "2024-03-05T10:15:00Z"
+        duration_ms:
+          type: integer
+          description: Review duration in milliseconds
+          example: 45000
+
+    ReviewResult:
+      type: object
+      description: |
+        Review results from all participating agents. The set of agents is
+        dynamic — determined by the review plan, not a fixed list. Each
+        agent produces findings with common fields (id, severity, title,
+        description, recommendation, references) plus agent-specific
+        enrichment fields defined by that agent's finding_schema in the
+        registry.
+      properties:
+        summary:
+          type: object
+          properties:
+            total_findings:
+              type: integer
+              example: 32
+            critical_severity:
+              type: integer
+              example: 3
+            high_severity:
+              type: integer
+              example: 8
+            medium_severity:
+              type: integer
+              example: 15
+            low_severity:
+              type: integer
+              example: 6
+            by_agent:
+              type: object
+              description: Finding count per agent type
+              additionalProperties:
+                type: integer
+              example:
+                architecture: 10
+                security: 12
+                risk: 10
+        reviews:
+          type: object
+          description: |
+            Agent results keyed by agent_type. Keys are dynamic — any
+            enabled review agent can appear (e.g. architecture, security,
+            risk, cri_review, eu_regulatory).
+          additionalProperties:
+            type: object
+            properties:
+              findings:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Finding'
+              summary:
+                type: string
+                description: Agent's narrative summary
+              status:
+                type: string
+                enum: [completed, failed, timeout]
+              status_reason:
+                type: string
+        plan:
+          $ref: '#/components/schemas/ReviewPlan'
+        metrics:
+          type: object
+          description: Token usage and timing metrics
+          properties:
+            total_tokens:
+              type: integer
+            input_tokens:
+              type: integer
+            output_tokens:
+              type: integer
+
+    Finding:
+      type: object
+      description: |
+        A single review finding. All findings share the common fields below.
+        Agent-specific enrichment fields (e.g. owasp_category for security,
+        quality_attribute for architecture, likelihood/consequence for risk)
+        are defined by each agent's finding_schema in the registry and appear
+        as additional properties.
+      required:
+        - id
+        - severity
+        - title
+        - description
+        - recommendation
+      properties:
+        id:
+          type: string
+          description: Unique finding identifier
+          example: "SEC-001"
+        severity:
+          type: string
+          enum: [critical, high, medium, low]
+          example: "high"
+        title:
+          type: string
+          description: Brief finding title
+          example: "Credit Card Data Stored Unencrypted"
+        description:
+          type: string
+          description: Detailed finding description (markdown)
+          example: "Credit card data is stored in the database without encryption, violating PCI DSS requirements."
+        recommendation:
+          type: string
+          description: Specific, actionable recommendation (markdown)
+          example: "Use a PCI DSS compliant payment processor like Stripe. Never store raw credit card data."
+        references:
+          type: array
+          items:
+            type: string
+          description: References to document sections
+          example: ["Section 4.3 Data Protection", "PCI DSS Requirement 3.4"]
+      additionalProperties: true
+
+    ReviewPlan:
+      type: object
+      properties:
+        plan_id:
+          type: string
+          example: "plan_a1b2c3"
+        document_type:
+          type: string
+          example: "microservices_architecture"
+        complexity:
+          type: string
+          enum: [low, medium, high]
+          example: "high"
+        rationale:
+          type: string
+          example: "Distributed event-driven system requiring thorough review"
+        status:
+          type: string
+          enum: [pending_approval, approved, rejected, expired]
+          example: "pending_approval"
+        groups:
+          type: array
+          items:
+            type: object
+            properties:
+              group_id:
+                type: string
+              label:
+                type: string
+              execution:
+                type: string
+                enum: [parallel, sequential]
+              agents:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    agent_type:
+                      type: string
+                      enum: [architecture, security, risk]
+                    depth:
+                      type: string
+                      enum: [quick, standard, thorough]
+                    focus_areas:
+                      type: array
+                      items:
+                        type: string
+                    prompt_addendum:
+                      type: string
+
+    CreateBenchmarkRequest:
+      type: object
+      required:
+        - name
+        - document_project_id
+        - agent_type
+        - configurations
+      properties:
+        name:
+          type: string
+          description: Human-readable benchmark name
+          example: "Sonnet 4 vs Haiku — Architecture"
+        document_project_id:
+          type: string
+          description: Source project ID for the document to benchmark against
+          example: "proj_abc"
+        agent_type:
+          type: string
+          description: Agent type to benchmark
+          example: "architecture"
+        configurations:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/BenchmarkConfiguration'
+
+    BenchmarkConfiguration:
+      type: object
+      required:
+        - model_id
+        - label
+      properties:
+        config_id:
+          type: string
+          description: Unique config identifier (auto-generated if omitted)
+        label:
+          type: string
+          description: Human-readable label
+          example: "Sonnet 4 (standard depth)"
+        model_id:
+          type: string
+          description: Bedrock model ID
+          example: "us.anthropic.claude-sonnet-4-20250514-v1:0"
+        depth:
+          type: string
+          enum: [quick, standard, thorough]
+          default: standard
+        prompt_version:
+          type: string
+          default: "v1"
+
+    BenchmarkResponse:
+      type: object
+      properties:
+        benchmark_id:
+          type: string
+        name:
+          type: string
+        document_project_id:
+          type: string
+        agent_type:
+          type: string
+        configurations:
+          type: array
+          items:
+            $ref: '#/components/schemas/BenchmarkConfiguration'
+        status:
+          type: string
+          enum: [pending, running, completed, partial, failed]
+        created_at:
+          type: string
+          format: date-time
+
+    BenchmarkSummary:
+      type: object
+      properties:
+        benchmark_id:
+          type: string
+        name:
+          type: string
+        document_project_id:
+          type: string
+        agent_type:
+          type: string
+        status:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+
+    BenchmarkDetailResponse:
+      allOf:
+        - $ref: '#/components/schemas/BenchmarkResponse'
+        - type: object
+          properties:
+            runs:
+              type: array
+              items:
+                $ref: '#/components/schemas/BenchmarkRunResult'
+
+    BenchmarkRunResult:
+      type: object
+      properties:
+        config_id:
+          type: string
+        status:
+          type: string
+          enum: [completed, failed]
+        findings:
+          type: array
+          items:
+            $ref: '#/components/schemas/Finding'
+        summary:
+          type: string
+        quality_scores:
+          type: object
+          properties:
+            completeness:
+              type: number
+            specificity:
+              type: number
+            actionability:
+              type: number
+            overall:
+              type: number
+        metrics:
+          type: object
+          properties:
+            input_tokens:
+              type: integer
+            output_tokens:
+              type: integer
+            total_tokens:
+              type: integer
+            total_duration_s:
+              type: number
+            judge_input_tokens:
+              type: integer
+            judge_output_tokens:
+              type: integer
+        completed_at:
+          type: string
+          format: date-time
+
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string
+          description: Error message
+          example: "Invalid request"
+        details:
+          type: string
+          description: Additional error details
+          example: "Missing required field: name"
+
+  responses:
+    BadRequest:
+      description: Invalid request
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            missing_field:
+              summary: Missing required field
+              value:
+                error: "Missing required field: name"
+            invalid_agent:
+              summary: Invalid agent name
+              value:
+                error: "Invalid agent. Must be one of: architecture, security, risk"
+
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            project_not_found:
+              summary: Project not found
+              value:
+                error: "Project not found: abc123"
+
+    InternalError:
+      description: Internal server error
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            server_error:
+              summary: Server error
+              value:
+                error: "Internal server error"
+                details: "Failed to invoke agent"
+
+  securitySchemes:
+    CognitoAuth:
+      type: oauth2
+      description: Cognito User Pool JWT authentication
+      x-amazon-apigateway-authorizer:
+        type: jwt
+        identitySource: "$request.header.Authorization"
+        jwtConfiguration:
+          audience:
+            - "${cognito_client_id}"
+          issuer: "${cognito_issuer_url}"
+
+security:
+  - CognitoAuth: []

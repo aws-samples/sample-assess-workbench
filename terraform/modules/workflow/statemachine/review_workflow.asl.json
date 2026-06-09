@@ -1,0 +1,963 @@
+{
+  "Comment": "Adaptive Document Review Workflow — AI-planned, multi-agent execution with workflow variables",
+  "StartAt": "InitWorkflow",
+  "States": {
+
+    "InitWorkflow": {
+      "Type": "Pass",
+      "Comment": "Assign stable context fields to workflow variables from execution input",
+      "Assign": {
+        "project_id.$": "$.project_id",
+        "review_id.$": "$.review_id",
+        "s3_bucket.$": "$.s3_bucket",
+        "s3_key.$": "$.s3_key",
+        "connection_id.$": "$.connection_id",
+        "user_sub.$": "$.user_sub",
+        "websocket_endpoint.$": "$.websocket_endpoint",
+        "files.$": "$.files"
+      },
+      "Next": "UpdateStatusInProgress"
+    },
+
+    "UpdateStatusInProgress": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "${dynamodb_table_name}",
+        "Key": {
+          "PK": { "S.$": "States.Format('PROJECT#{}', $project_id)" },
+          "SK": { "S": "METADATA" }
+        },
+        "UpdateExpression": "SET #status = :status, updated_at = :timestamp",
+        "ExpressionAttributeNames": { "#status": "status" },
+        "ExpressionAttributeValues": {
+          ":status": { "S": "in_progress" },
+          ":timestamp": { "S.$": "$$.State.EnteredTime" }
+        }
+      },
+      "ResultPath": null,
+      "Next": "LoadDocument",
+      "Catch": [{
+        "ErrorEquals": ["States.ALL"],
+        "Next": "UpdateStatusFailed",
+        "ResultPath": "$.error"
+      }]
+    },
+
+    "LoadDocument": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${load_document_fn}",
+        "Payload": {
+          "project_id.$": "$project_id",
+          "review_id.$": "$review_id",
+          "s3_bucket.$": "$s3_bucket",
+          "s3_key.$": "$s3_key",
+          "connection_id.$": "$connection_id",
+          "user_sub.$": "$user_sub",
+          "websocket_endpoint.$": "$websocket_endpoint",
+          "files.$": "$files"
+        }
+      },
+      "Assign": {
+        "document_s3_key.$": "$.Payload.document_s3_key",
+        "project_name.$": "$.Payload.project_name",
+        "project_description.$": "$.Payload.project_description",
+        "image_analysis_metrics.$": "$.Payload.image_analysis_metrics"
+      },
+      "ResultPath": null,
+      "Retry": [{
+        "ErrorEquals": ["States.TaskFailed", "Lambda.ServiceException"],
+        "IntervalSeconds": 5,
+        "MaxAttempts": 2,
+        "BackoffRate": 2.0
+      }],
+      "Next": "IndexDocument",
+      "Catch": [{
+        "ErrorEquals": ["States.ALL"],
+        "Next": "UpdateStatusFailed",
+        "ResultPath": "$.error"
+      }]
+    },
+
+    "IndexDocument": {
+      "Type": "Task",
+      "Comment": "Push document content to Bedrock KB for semantic search. Returns ingestion job metadata.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${index_document_fn}",
+        "Payload": {
+          "mode": "ingest",
+          "project_id.$": "$project_id",
+          "review_id.$": "$review_id",
+          "s3_bucket.$": "$s3_bucket",
+          "document_s3_key.$": "$document_s3_key",
+          "connection_id.$": "$connection_id",
+          "user_sub.$": "$user_sub",
+          "websocket_endpoint.$": "$websocket_endpoint"
+        }
+      },
+      "Assign": {
+        "indexing_status.$": "$.Payload.indexing_status",
+        "document_identifier.$": "$.Payload.document_identifier"
+      },
+      "ResultPath": null,
+      "Retry": [{
+        "ErrorEquals": ["States.TaskFailed", "Lambda.ServiceException"],
+        "IntervalSeconds": 5,
+        "MaxAttempts": 2,
+        "BackoffRate": 2.0
+      }],
+      "Next": "CheckIndexingStatus",
+      "Catch": [{
+        "ErrorEquals": ["States.ALL"],
+        "Next": "PlanReview",
+        "Comment": "Indexing failure is non-fatal — review proceeds without document search",
+        "ResultPath": "$.indexing_error"
+      }]
+    },
+
+    "CheckIndexingStatus": {
+      "Type": "Choice",
+      "Comment": "Route based on indexing status: SKIPPED/INDEXED → proceed, PENDING → wait, FAILED → proceed without search",
+      "Choices": [
+        {
+          "Or": [
+            { "Variable": "$indexing_status", "StringEquals": "SKIPPED" },
+            { "Variable": "$indexing_status", "StringEquals": "INDEXED" }
+          ],
+          "Next": "PlanReview"
+        },
+        {
+          "Variable": "$indexing_status",
+          "StringEquals": "FAILED",
+          "Next": "PlanReview"
+        }
+      ],
+      "Default": "WaitForIndexing"
+    },
+
+    "WaitForIndexing": {
+      "Type": "Wait",
+      "Seconds": 5,
+      "Next": "CheckIndexStatus"
+    },
+
+    "CheckIndexStatus": {
+      "Type": "Task",
+      "Comment": "Poll Bedrock KB for document indexing completion",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${index_document_fn}",
+        "Payload": {
+          "mode": "check_status",
+          "project_id.$": "$project_id",
+          "review_id.$": "$review_id",
+          "document_identifier.$": "$document_identifier",
+          "connection_id.$": "$connection_id",
+          "user_sub.$": "$user_sub",
+          "websocket_endpoint.$": "$websocket_endpoint"
+        }
+      },
+      "Assign": {
+        "indexing_status.$": "$.Payload.indexing_status"
+      },
+      "ResultPath": null,
+      "Retry": [{
+        "ErrorEquals": ["States.TaskFailed", "Lambda.ServiceException"],
+        "IntervalSeconds": 3,
+        "MaxAttempts": 2,
+        "BackoffRate": 2.0
+      }],
+      "Next": "CheckIndexingStatus",
+      "Catch": [{
+        "ErrorEquals": ["States.ALL"],
+        "Next": "PlanReview",
+        "Comment": "Status check failure is non-fatal — proceed without confirmation",
+        "ResultPath": "$.indexing_error"
+      }]
+    },
+
+    "PlanReview": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${plan_review_fn}",
+        "Payload": {
+          "project_id.$": "$project_id",
+          "review_id.$": "$review_id",
+          "s3_bucket.$": "$s3_bucket",
+          "document_s3_key.$": "$document_s3_key",
+          "connection_id.$": "$connection_id",
+          "user_sub.$": "$user_sub",
+          "websocket_endpoint.$": "$websocket_endpoint"
+        }
+      },
+      "Assign": {
+        "plan.$": "$.Payload.plan",
+        "planning_duration_ms.$": "$.Payload.planning_duration_ms"
+      },
+      "ResultPath": null,
+      "Retry": [{
+        "ErrorEquals": ["States.TaskFailed", "Lambda.ServiceException"],
+        "IntervalSeconds": 5,
+        "MaxAttempts": 1,
+        "BackoffRate": 2.0
+      }],
+      "Next": "WaitForApproval",
+      "Catch": [{
+        "ErrorEquals": ["States.ALL"],
+        "Next": "UpdateStatusFailed",
+        "ResultPath": "$.error"
+      }]
+    },
+
+    "WaitForApproval": {
+      "Type": "Task",
+      "Comment": "Callback pattern: store_plan saves the task token, external approval calls SendTaskSuccess with the (possibly modified) plan. Assign overwrites $plan with the callback output.",
+      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+      "Parameters": {
+        "FunctionName": "${store_plan_fn}",
+        "Payload": {
+          "task_token.$": "$$.Task.Token",
+          "project_id.$": "$project_id",
+          "review_id.$": "$review_id",
+          "plan.$": "$plan",
+          "connection_id.$": "$connection_id",
+          "user_sub.$": "$user_sub",
+          "websocket_endpoint.$": "$websocket_endpoint"
+        }
+      },
+      "TimeoutSeconds": 3600,
+      "Assign": {
+        "plan.$": "$"
+      },
+      "ResultPath": null,
+      "Next": "ResolveAgentARNs",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.Timeout"],
+          "Next": "UpdateStatusFailed",
+          "ResultPath": "$.error"
+        },
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "UpdateStatusFailed",
+          "ResultPath": "$.error"
+        }
+      ]
+    },
+
+    "ResolveAgentARNs": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${resolve_agent_arns_fn}",
+        "Payload": {
+          "plan.$": "$plan"
+        }
+      },
+      "Assign": {
+        "agent_arns.$": "$.Payload.agent_arns",
+        "group_results": []
+      },
+      "Comment": "Also initializes $group_results to [] here — ExecuteGroups Map overwrites it with actual results",
+      "ResultPath": null,
+      "Retry": [{
+        "ErrorEquals": ["States.TaskFailed", "Lambda.ServiceException"],
+        "IntervalSeconds": 5,
+        "MaxAttempts": 2,
+        "BackoffRate": 2.0
+      }],
+      "Next": "ExecuteGroups",
+      "Catch": [{
+        "ErrorEquals": ["States.ALL"],
+        "Next": "UpdateStatusFailed",
+        "ResultPath": "$.error"
+      }]
+    },
+
+    "ExecuteGroups": {
+      "Type": "Map",
+      "ItemsPath": "$plan.groups",
+      "MaxConcurrency": 1,
+      "ItemSelector": {
+        "group.$": "$$.Map.Item.Value"
+      },
+      "Iterator": {
+        "StartAt": "ExecuteAgentsInGroup",
+        "States": {
+
+          "ExecuteAgentsInGroup": {
+            "Type": "Map",
+            "ItemsPath": "$.group.agents",
+            "MaxConcurrency": 0,
+            "ItemSelector": {
+              "agent_type.$": "$$.Map.Item.Value.agent_type",
+              "depth.$": "$$.Map.Item.Value.depth",
+              "focus_areas.$": "$$.Map.Item.Value.focus_areas",
+              "prompt_addendum.$": "$$.Map.Item.Value.prompt_addendum",
+              "judge.$": "$$.Map.Item.Value.judge",
+              "coach_guidance.$": "$$.Map.Item.Value.coach_guidance"
+            },
+            "Iterator": {
+              "StartAt": "InitCoachState",
+              "States": {
+
+                "InitCoachState": {
+                  "Type": "Pass",
+                  "Assign": {
+                    "iteration": 0,
+                    "prior_critique": "",
+                    "prior_findings": [],
+                    "prior_strengths": [],
+                    "prior_gaps": [],
+                    "prior_score": 0,
+                    "consecutive_drops": 0,
+                    "coach_durations": []
+                  },
+                  "Next": "InvokeAgent"
+                },
+
+                "InvokeAgent": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::lambda:invoke",
+                  "Parameters": {
+                    "FunctionName": "${invoke_review_agent_fn}",
+                    "Payload": {
+                      "agent_type.$": "$.agent_type",
+                      "depth.$": "$.depth",
+                      "focus_areas.$": "$.focus_areas",
+                      "prompt_addendum.$": "$.prompt_addendum",
+                      "s3_bucket.$": "$s3_bucket",
+                      "document_s3_key.$": "$document_s3_key",
+                      "project_id.$": "$project_id",
+                      "review_id.$": "$review_id",
+                      "connection_id.$": "$connection_id",
+                      "user_sub.$": "$user_sub",
+                      "websocket_endpoint.$": "$websocket_endpoint",
+                      "prior_critique.$": "$prior_critique",
+                      "prior_findings.$": "$prior_findings",
+                      "prior_strengths.$": "$prior_strengths",
+                      "prior_gaps.$": "$prior_gaps",
+                      "iteration.$": "$iteration",
+                      "max_iterations.$": "$.judge.max_iterations",
+                      "agent_arns.$": "$agent_arns"
+                    }
+                  },
+                  "ResultSelector": {
+                    "agent_type.$": "$.Payload.agent_type",
+                    "findings.$": "$.Payload.findings",
+                    "summary.$": "$.Payload.summary",
+                    "metrics.$": "$.Payload.metrics"
+                  },
+                  "ResultPath": "$.agent_result",
+                  "Retry": [{
+                    "ErrorEquals": ["States.TaskFailed", "Lambda.ServiceException"],
+                    "IntervalSeconds": 10,
+                    "MaxAttempts": 1,
+                    "BackoffRate": 2.0
+                  }],
+                  "Next": "CheckJudgeEnabled",
+                  "Catch": [{
+                    "ErrorEquals": ["States.ALL"],
+                    "ResultPath": "$.error",
+                    "Next": "HandleAgentError"
+                  }]
+                },
+
+                "HandleAgentError": {
+                  "Type": "Choice",
+                  "Comment": "If iteration >= 1 we have prior findings to fall back on — recover gracefully instead of failing the agent",
+                  "Choices": [{
+                    "Variable": "$iteration",
+                    "NumericGreaterThanEquals": 1,
+                    "Next": "RecoverFromError"
+                  }],
+                  "Default": "AgentFailed"
+                },
+
+                "RecoverFromError": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::lambda:invoke",
+                  "Parameters": {
+                    "FunctionName": "${notify_agent_status_fn}",
+                    "Payload": {
+                      "agent_type.$": "$.agent_type",
+                      "findings.$": "$prior_findings",
+                      "summary": "Agent timed out — returning prior iteration findings",
+                      "metrics": {},
+                      "status": "recovered",
+                      "status_reason": "Agent timed out during coach iteration — prior iteration findings returned",
+                      "connection_id.$": "$connection_id",
+                      "user_sub.$": "$user_sub",
+                      "websocket_endpoint.$": "$websocket_endpoint"
+                    }
+                  },
+                  "ResultSelector": {
+                    "agent_type.$": "$.Payload.agent_type",
+                    "findings.$": "$.Payload.findings",
+                    "summary.$": "$.Payload.summary",
+                    "metrics.$": "$.Payload.metrics",
+                    "status.$": "$.Payload.status",
+                    "status_reason.$": "$.Payload.status_reason"
+                  },
+                  "End": true
+                },
+
+                "CheckJudgeEnabled": {
+                  "Type": "Choice",
+                  "Choices": [{
+                    "Variable": "$.judge.enabled",
+                    "BooleanEquals": true,
+                    "Next": "InvokeCoachJudge"
+                  }],
+                  "Default": "AgentDone"
+                },
+
+                "InvokeCoachJudge": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::lambda:invoke",
+                  "Parameters": {
+                    "FunctionName": "${invoke_judge_fn}",
+                    "Payload": {
+                      "agent_type.$": "$.agent_type",
+                      "findings.$": "$.agent_result.findings",
+                      "summary.$": "$.agent_result.summary",
+                      "focus_areas.$": "$.focus_areas",
+                      "s3_bucket.$": "$s3_bucket",
+                      "document_s3_key.$": "$document_s3_key",
+                      "quality_threshold.$": "$.judge.quality_threshold",
+                      "coach_guidance.$": "$.coach_guidance",
+                      "mode": "coach",
+                      "iteration.$": "$iteration",
+                      "prior_critique.$": "$prior_critique",
+                      "prior_score.$": "$prior_score",
+                      "consecutive_drops.$": "$consecutive_drops",
+                      "coach_durations.$": "$coach_durations",
+                      "project_id.$": "$project_id",
+                      "review_id.$": "$review_id",
+                      "connection_id.$": "$connection_id",
+                      "user_sub.$": "$user_sub",
+                      "websocket_endpoint.$": "$websocket_endpoint"
+                    }
+                  },
+                  "ResultSelector": {
+                    "evaluation.$": "$.Payload.evaluation",
+                    "metrics.$": "$.Payload.metrics",
+                    "overall_score.$": "$.Payload.overall_score",
+                    "consecutive_drops.$": "$.Payload.consecutive_drops",
+                    "coach_durations.$": "$.Payload.coach_durations"
+                  },
+                  "ResultPath": "$.judge_result",
+                  "Retry": [{
+                    "ErrorEquals": ["States.TaskFailed", "Lambda.ServiceException"],
+                    "IntervalSeconds": 5,
+                    "MaxAttempts": 1,
+                    "BackoffRate": 2.0
+                  }],
+                  "Next": "CheckQuality",
+                  "Catch": [{
+                    "ErrorEquals": ["States.ALL"],
+                    "Next": "AgentDone",
+                    "ResultPath": "$.judge_error"
+                  }]
+                },
+
+                "CheckQuality": {
+                  "Type": "Choice",
+                  "Choices": [{
+                    "Variable": "$.judge_result.evaluation.quality_met",
+                    "BooleanEquals": true,
+                    "Next": "AgentDone"
+                  }],
+                  "Default": "CheckMaxIterations"
+                },
+
+                "CheckMaxIterations": {
+                  "Type": "Choice",
+                  "Choices": [{
+                    "Variable": "$iteration",
+                    "NumericGreaterThanEqualsPath": "$.judge.max_iterations",
+                    "Next": "AgentDone"
+                  }],
+                  "Default": "PrepareRetry"
+                },
+
+                "PrepareRetry": {
+                  "Type": "Pass",
+                  "Assign": {
+                    "prior_critique.$": "$.judge_result.evaluation.critique",
+                    "prior_findings.$": "$.agent_result.findings",
+                    "prior_strengths.$": "$.judge_result.evaluation.strengths",
+                    "prior_gaps.$": "$.judge_result.evaluation.gaps",
+                    "prior_score.$": "$.judge_result.overall_score",
+                    "consecutive_drops.$": "$.judge_result.consecutive_drops",
+                    "coach_durations.$": "$.judge_result.coach_durations",
+                    "iteration.$": "States.MathAdd($iteration, 1)"
+                  },
+                  "Next": "InvokeAgent"
+                },
+
+                "AgentDone": {
+                  "Type": "Pass",
+                  "Parameters": {
+                    "agent_type.$": "$.agent_result.agent_type",
+                    "findings.$": "$.agent_result.findings",
+                    "summary.$": "$.agent_result.summary",
+                    "metrics.$": "$.agent_result.metrics",
+                    "coach_durations.$": "$coach_durations",
+                    "status": "completed"
+                  },
+                  "End": true
+                },
+
+                "AgentFailed": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::lambda:invoke",
+                  "Parameters": {
+                    "FunctionName": "${notify_agent_status_fn}",
+                    "Payload": {
+                      "agent_type.$": "$.agent_type",
+                      "findings": [],
+                      "summary": "Agent failed",
+                      "metrics": {},
+                      "status": "failed",
+                      "status_reason.$": "$.error.Error",
+                      "connection_id.$": "$connection_id",
+                      "user_sub.$": "$user_sub",
+                      "websocket_endpoint.$": "$websocket_endpoint"
+                    }
+                  },
+                  "ResultSelector": {
+                    "agent_type.$": "$.Payload.agent_type",
+                    "findings.$": "$.Payload.findings",
+                    "summary.$": "$.Payload.summary",
+                    "status.$": "$.Payload.status",
+                    "status_reason.$": "$.Payload.status_reason"
+                  },
+                  "End": true
+                }
+              }
+            },
+            "Next": "CheckGroupForFailures"
+          },
+
+          "CheckGroupForFailures": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "Parameters": {
+              "FunctionName": "${notify_agent_status_fn}",
+              "Payload": {
+                "mode": "check_group",
+                "group_results.$": "$",
+                "project_id.$": "$project_id",
+                "review_id.$": "$review_id",
+                "connection_id.$": "$connection_id",
+                "user_sub.$": "$user_sub",
+                "websocket_endpoint.$": "$websocket_endpoint"
+              }
+            },
+            "ResultPath": null,
+            "OutputPath": "$",
+            "End": true
+          }
+        }
+      },
+      "Assign": {
+        "group_results.$": "$"
+      },
+      "ResultPath": null,
+      "Next": "Aggregate",
+      "Catch": [
+        {
+          "ErrorEquals": ["AgentGroupFailedError"],
+          "Next": "AggregatePartialResults",
+          "ResultPath": "$.error"
+        },
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "UpdateStatusFailed",
+          "ResultPath": "$.error"
+        }
+      ]
+    },
+
+    "AggregatePartialResults": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${aggregate_results_fn}",
+        "Payload": {
+          "project_id.$": "$project_id",
+          "review_id.$": "$review_id",
+          "project_name.$": "$project_name",
+          "project_description.$": "$project_description",
+          "plan.$": "$plan",
+          "group_results.$": "$group_results",
+          "connection_id.$": "$connection_id",
+          "user_sub.$": "$user_sub",
+          "websocket_endpoint.$": "$websocket_endpoint",
+          "image_analysis_metrics.$": "$image_analysis_metrics",
+          "s3_bucket.$": "$s3_bucket",
+          "document_s3_key.$": "$document_s3_key",
+          "execution_start_time.$": "$$.Execution.StartTime",
+          "planning_duration_ms.$": "$planning_duration_ms"
+        }
+      },
+      "Assign": {
+        "findings_s3_key.$": "$.Payload.findings_s3_key",
+        "created_at.$": "$.Payload.created_at",
+        "duration_ms.$": "$.Payload.duration_ms",
+        "status.$": "$.Payload.status",
+        "participating_agents.$": "$.Payload.participating_agents"
+      },
+      "ResultPath": null,
+      "Next": "StorePartialResults",
+      "Catch": [{
+        "ErrorEquals": ["States.ALL"],
+        "Next": "UpdateStatusFailed",
+        "ResultPath": "$.error"
+      }]
+    },
+
+    "StorePartialResults": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${store_results_fn}",
+        "Payload": {
+          "project_id.$": "$project_id",
+          "review_id.$": "$review_id",
+          "status.$": "$status",
+          "s3_bucket.$": "$s3_bucket",
+          "findings_s3_key.$": "$findings_s3_key",
+          "created_at.$": "$created_at",
+          "duration_ms.$": "$duration_ms",
+          "connection_id.$": "$connection_id",
+          "user_sub.$": "$user_sub",
+          "websocket_endpoint.$": "$websocket_endpoint"
+        }
+      },
+      "ResultPath": null,
+      "Retry": [{
+        "ErrorEquals": ["States.TaskFailed", "Lambda.ServiceException"],
+        "IntervalSeconds": 5,
+        "MaxAttempts": 2,
+        "BackoffRate": 2.0
+      }],
+      "Next": "UpdateStatusFailed",
+      "Catch": [{
+        "ErrorEquals": ["States.ALL"],
+        "Next": "UpdateStatusFailed",
+        "ResultPath": "$.error"
+      }]
+    },
+
+    "Aggregate": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${aggregate_results_fn}",
+        "Payload": {
+          "project_id.$": "$project_id",
+          "review_id.$": "$review_id",
+          "project_name.$": "$project_name",
+          "project_description.$": "$project_description",
+          "plan.$": "$plan",
+          "group_results.$": "$group_results",
+          "connection_id.$": "$connection_id",
+          "user_sub.$": "$user_sub",
+          "websocket_endpoint.$": "$websocket_endpoint",
+          "image_analysis_metrics.$": "$image_analysis_metrics",
+          "s3_bucket.$": "$s3_bucket",
+          "document_s3_key.$": "$document_s3_key",
+          "execution_start_time.$": "$$.Execution.StartTime",
+          "planning_duration_ms.$": "$planning_duration_ms"
+        }
+      },
+      "Assign": {
+        "findings_s3_key.$": "$.Payload.findings_s3_key",
+        "quality_inputs.$": "$.Payload.quality_inputs",
+        "created_at.$": "$.Payload.created_at",
+        "duration_ms.$": "$.Payload.duration_ms",
+        "status.$": "$.Payload.status",
+        "participating_agents.$": "$.Payload.participating_agents"
+      },
+      "ResultPath": null,
+      "Next": "EvaluateQuality",
+      "Catch": [{
+        "ErrorEquals": ["States.ALL"],
+        "Next": "UpdateStatusFailed",
+        "ResultPath": "$.error"
+      }]
+    },
+
+    "EvaluateQuality": {
+      "Type": "Map",
+      "ItemsPath": "$quality_inputs",
+      "MaxConcurrency": 0,
+      "ItemSelector": {
+        "agent_type.$": "$$.Map.Item.Value.agent_type",
+        "focus_areas.$": "$$.Map.Item.Value.focus_areas",
+        "coach_guidance.$": "$$.Map.Item.Value.coach_guidance",
+        "quality_threshold": 0.8,
+        "mode": "evaluate",
+        "iteration": 0,
+        "prior_critique": ""
+      },
+      "Iterator": {
+        "StartAt": "InvokeJudge",
+        "States": {
+          "InvokeJudge": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "Parameters": {
+              "FunctionName": "${invoke_judge_fn}",
+              "Payload": {
+                "agent_type.$": "$.agent_type",
+                "focus_areas.$": "$.focus_areas",
+                "coach_guidance.$": "$.coach_guidance",
+                "s3_bucket.$": "$s3_bucket",
+                "findings_s3_key.$": "$findings_s3_key",
+                "document_s3_key.$": "$document_s3_key",
+                "project_id.$": "$project_id",
+                "review_id.$": "$review_id",
+                "quality_threshold.$": "$.quality_threshold",
+                "mode.$": "$.mode",
+                "iteration.$": "$.iteration",
+                "prior_critique.$": "$.prior_critique",
+                "connection_id.$": "$connection_id",
+                "user_sub.$": "$user_sub",
+                "websocket_endpoint.$": "$websocket_endpoint"
+              }
+            },
+            "ResultSelector": {
+              "agent_type.$": "$.Payload.agent_type",
+              "evaluation.$": "$.Payload.evaluation",
+              "metrics.$": "$.Payload.metrics"
+            },
+            "Retry": [{
+              "ErrorEquals": ["States.TaskFailed", "Lambda.ServiceException"],
+              "IntervalSeconds": 5,
+              "MaxAttempts": 1,
+              "BackoffRate": 2.0
+            }],
+            "End": true,
+            "Catch": [{
+              "ErrorEquals": ["States.ALL"],
+              "ResultPath": "$.error",
+              "Next": "JudgeFailed"
+            }]
+          },
+
+          "JudgeFailed": {
+            "Type": "Pass",
+            "Parameters": {
+              "agent_type.$": "$.agent_type",
+              "evaluation": {
+                "quality_met": false,
+                "overall_score": 0,
+                "scores_by_criterion": {
+                  "completeness": 0,
+                  "specificity": 0,
+                  "actionability": 0
+                },
+                "critique": "Judge evaluation failed",
+                "strengths": [],
+                "gaps": ["Evaluation unavailable"]
+              }
+            },
+            "End": true
+          }
+        }
+      },
+      "Assign": {
+        "quality_results.$": "$"
+      },
+      "ResultPath": null,
+      "Next": "MergeQualityScores",
+      "Catch": [{
+        "ErrorEquals": ["States.ALL"],
+        "Next": "NotifyJudgeFailure",
+        "ResultPath": "$.quality_error"
+      }]
+    },
+
+    "MergeQualityScores": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${merge_quality_fn}",
+        "Payload": {
+          "s3_bucket.$": "$s3_bucket",
+          "findings_s3_key.$": "$findings_s3_key",
+          "quality_results.$": "$quality_results",
+          "project_id.$": "$project_id",
+          "review_id.$": "$review_id",
+          "connection_id.$": "$connection_id",
+          "user_sub.$": "$user_sub",
+          "websocket_endpoint.$": "$websocket_endpoint"
+        }
+      },
+      "Assign": {
+        "findings_s3_key.$": "$.Payload.findings_s3_key"
+      },
+      "ResultPath": null,
+      "Next": "StoreResults",
+      "Catch": [{
+        "ErrorEquals": ["States.ALL"],
+        "Next": "NotifyJudgeFailure",
+        "ResultPath": "$.quality_error"
+      }]
+    },
+
+    "NotifyJudgeFailure": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${merge_quality_fn}",
+        "Payload": {
+          "s3_bucket.$": "$s3_bucket",
+          "findings_s3_key.$": "$findings_s3_key",
+          "quality_error.$": "$.quality_error",
+          "project_id.$": "$project_id",
+          "review_id.$": "$review_id",
+          "connection_id.$": "$connection_id",
+          "user_sub.$": "$user_sub",
+          "websocket_endpoint.$": "$websocket_endpoint"
+        }
+      },
+      "ResultPath": null,
+      "Next": "StoreResults",
+      "Catch": [{
+        "ErrorEquals": ["States.ALL"],
+        "Next": "StoreResults",
+        "ResultPath": null
+      }]
+    },
+
+    "StoreResults": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${store_results_fn}",
+        "Payload": {
+          "project_id.$": "$project_id",
+          "review_id.$": "$review_id",
+          "status.$": "$status",
+          "s3_bucket.$": "$s3_bucket",
+          "findings_s3_key.$": "$findings_s3_key",
+          "created_at.$": "$created_at",
+          "duration_ms.$": "$duration_ms",
+          "connection_id.$": "$connection_id",
+          "user_sub.$": "$user_sub",
+          "websocket_endpoint.$": "$websocket_endpoint"
+        }
+      },
+      "ResultPath": null,
+      "Retry": [{
+        "ErrorEquals": ["States.TaskFailed", "Lambda.ServiceException"],
+        "IntervalSeconds": 5,
+        "MaxAttempts": 2,
+        "BackoffRate": 2.0
+      }],
+      "Next": "UpdateStatusCompleted",
+      "Catch": [{
+        "ErrorEquals": ["States.ALL"],
+        "Next": "PostCompletionErrorHandler",
+        "ResultPath": "$.error"
+      }]
+    },
+
+    "UpdateStatusCompleted": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "${dynamodb_table_name}",
+        "Key": {
+          "PK": { "S.$": "States.Format('PROJECT#{}', $project_id)" },
+          "SK": { "S": "METADATA" }
+        },
+        "UpdateExpression": "SET #status = :status, updated_at = :timestamp, participating_agents = :agents",
+        "ExpressionAttributeNames": { "#status": "status" },
+        "ExpressionAttributeValues": {
+          ":status": { "S": "completed" },
+          ":timestamp": { "S.$": "$$.State.EnteredTime" },
+          ":agents": { "S.$": "$participating_agents" }
+        }
+      },
+      "End": true,
+      "Catch": [{
+        "ErrorEquals": ["States.ALL"],
+        "Next": "PostCompletionErrorHandler",
+        "ResultPath": "$.error"
+      }]
+    },
+
+    "PostCompletionErrorHandler": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${post_completion_error_fn}",
+        "Payload": {
+          "project_id.$": "$project_id",
+          "review_id.$": "$review_id",
+          "error.$": "$.error",
+          "connection_id.$": "$connection_id",
+          "user_sub.$": "$user_sub",
+          "websocket_endpoint.$": "$websocket_endpoint"
+        }
+      },
+      "ResultPath": null,
+      "End": true,
+      "Catch": [{
+        "ErrorEquals": ["States.ALL"],
+        "Next": "UpdateStatusFailed",
+        "ResultPath": "$.error"
+      }]
+    },
+
+    "UpdateStatusFailed": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${update_status_failed_fn}",
+        "Payload": {
+          "project_id.$": "$project_id",
+          "error.$": "$.error",
+          "connection_id.$": "$connection_id",
+          "user_sub.$": "$user_sub",
+          "websocket_endpoint.$": "$websocket_endpoint"
+        }
+      },
+      "ResultPath": null,
+      "End": true,
+      "Catch": [{
+        "ErrorEquals": ["States.ALL"],
+        "Next": "UpdateStatusFailedFallback",
+        "ResultPath": null
+      }]
+    },
+
+    "UpdateStatusFailedFallback": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "${dynamodb_table_name}",
+        "Key": {
+          "PK": { "S.$": "States.Format('PROJECT#{}', $project_id)" },
+          "SK": { "S": "METADATA" }
+        },
+        "UpdateExpression": "SET #status = :status, updated_at = :timestamp",
+        "ExpressionAttributeNames": { "#status": "status" },
+        "ExpressionAttributeValues": {
+          ":status": { "S": "failed" },
+          ":timestamp": { "S.$": "$$.State.EnteredTime" }
+        }
+      },
+      "End": true
+    }
+  }
+}

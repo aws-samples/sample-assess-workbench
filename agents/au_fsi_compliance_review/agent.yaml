@@ -1,0 +1,66 @@
+name: au_fsi_compliance
+role: review
+ssm_key: agent/au_fsi_compliance_arn
+
+registry:
+  agent_type: au_fsi_compliance
+  display_name: AU FSI Compliance
+  icon: "🏛️"
+  color: "#2c3e50"
+  description: "Australian Financial Services Compliance agent. Assesses design compliance against Australian prudential standards (CPS 230, CPS 234), practice guides (CPG 230, CPG 234), ASIC obligations, Privacy Act requirements, and AUSTRAC AML/CTF obligations. Select for entities regulated by APRA, ASIC, or AUSTRAC. Do not select for non-Australian or non-financial-services entities."
+  category: compliance
+  sort_order: 5
+  default_depth: ""
+  chat_agent: au_fsi_compliance_chat
+  model_id: us.anthropic.claude-sonnet-4-6
+  tool_limits:
+    search_document: 5
+    get_prior_findings: 4
+    lookup_standard: 3
+  judge_defaults:
+    max_iterations: 2
+    quality_threshold: 0.7
+    coach_enabled: true
+  finding_schema:
+    severity_levels: [critical, high, medium, low]
+    severity_source: direct
+    primary_fields: [regulatory_reference, obligation_type, compliance_gap]
+    optional_fields: [remediation_timeframe, authority_level]
+    display_strategy: severity_badge_with_tags
+    fields:
+      regulatory_reference:
+        type: str
+        required: true
+        description: "Specific regulatory reference (e.g., 'CPS 234 paragraph 14', 'CPS 230 paragraph 22', 'APP 11.1', 'ASIC RG 271')"
+        display: badge
+        color: blue
+      obligation_type:
+        type: str
+        required: true
+        description: "Nature of the obligation: mandatory (prudential standard/legislation), guidance (CPG/regulatory guidance), best_practice (industry framework)"
+        enum: [mandatory, guidance, best_practice]
+        display: badge
+        color: purple
+      compliance_gap:
+        type: str
+        required: true
+        description: "Compliance posture: non_compliant (requirement not met), partially_compliant (partially addressed, gaps remain), insufficient_evidence (design does not demonstrate compliance)"
+        enum: [non_compliant, partially_compliant, insufficient_evidence]
+        display: badge
+        color: red
+      remediation_timeframe:
+        type: str
+        required: false
+        default: ""
+        description: "Recommended remediation timeframe: immediate (0-30 days), short_term (30-90 days), medium_term (90-180 days), long_term (180+ days)"
+        enum: [immediate, short_term, medium_term, long_term]
+        display: badge
+        color: amber
+      authority_level:
+        type: str
+        required: false
+        default: ""
+        description: "Source authority level: prudential_standard, regulatory_guidance, regulatory_commentary, industry_framework, legislation"
+        enum: [prudential_standard, regulatory_guidance, regulatory_commentary, industry_framework, legislation]
+        display: badge
+        color: cyan

@@ -1,0 +1,85 @@
+name: risk_manager
+role: review
+ssm_key: agent/risk_manager_arn
+
+registry:
+  agent_type: risk
+  display_name: Risk
+  icon: "⚠️"
+  color: "#ffc107"
+  description: "Reviews technical risks, operational risks, dependencies, disaster recovery, business impact"
+  category: technical
+  sort_order: 3
+  default_depth: ""
+  chat_agent: risk_chat
+  model_id: us.anthropic.claude-sonnet-4-6
+  tool_limits:
+    search_document: 5
+    get_prior_findings: 4
+    lookup_standard: 3
+  judge_defaults:
+    max_iterations: 2
+    quality_threshold: 0.7
+    coach_enabled: true
+  finding_schema:
+    severity_levels: [critical, high, medium, low]
+    severity_source: derived
+    primary_fields: [likelihood, consequence, risk_treatment]
+    optional_fields: [residual_risk]
+    display_strategy: likelihood_consequence
+    severity_derivation:
+      inputs: [likelihood, consequence]
+      matrix:
+        "almost_certain,catastrophic": critical
+        "almost_certain,major": critical
+        "almost_certain,moderate": high
+        "almost_certain,minor": medium
+        "almost_certain,insignificant": medium
+        "likely,catastrophic": critical
+        "likely,major": high
+        "likely,moderate": high
+        "likely,minor": medium
+        "likely,insignificant": low
+        "possible,catastrophic": high
+        "possible,major": high
+        "possible,moderate": medium
+        "possible,minor": low
+        "possible,insignificant": low
+        "unlikely,catastrophic": high
+        "unlikely,major": medium
+        "unlikely,moderate": medium
+        "unlikely,minor": low
+        "unlikely,insignificant": low
+        "rare,catastrophic": medium
+        "rare,major": medium
+        "rare,moderate": low
+        "rare,minor": low
+        "rare,insignificant": low
+    fields:
+      likelihood:
+        type: str
+        required: true
+        description: "Likelihood: almost_certain, likely, possible, unlikely, rare"
+        enum: [almost_certain, likely, possible, unlikely, rare]
+        display: badge
+        color: cyan
+      consequence:
+        type: str
+        required: true
+        description: "Consequence: catastrophic, major, moderate, minor, insignificant"
+        enum: [catastrophic, major, moderate, minor, insignificant]
+        display: badge
+        color: orange
+      risk_treatment:
+        type: str
+        required: true
+        description: "Treatment strategy: mitigate, transfer, accept, avoid"
+        enum: [mitigate, transfer, accept, avoid]
+        display: badge
+        color: purple
+      residual_risk:
+        type: str
+        required: false
+        default: ""
+        description: "Expected risk level after recommended treatment"
+        display: detail_only
