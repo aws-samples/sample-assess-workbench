@@ -1,0 +1,133 @@
+# =============================================================================
+# OS & Editor
+# =============================================================================
+.DS_Store
+Thumbs.db
+.idea/
+*.swp
+*.swo
+*~
+
+# =============================================================================
+# Kiro (settings are machine-specific, steering/hooks are shared)
+# =============================================================================
+.kiro/settings/
+.kiro/specs/
+
+# =============================================================================
+# Secrets & per-environment identity
+# =============================================================================
+.env
+config/local.yaml
+
+# Per-environment identity (account IDs + profile names live here, never in
+# tracked files). All env.d/<env>.env are account-specific and gitignored;
+# env.d/ is an opt-in, multi-account override dir that ships nowhere. The
+# template/guidance lives in .env.example.
+env.d/*.env
+
+# OIDC / federation client secret (injected at deploy time via TF_VAR, never
+# committed).
+oidc_client_secret
+
+# =============================================================================
+# Python
+# =============================================================================
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+.venv/
+.python-version
+
+# Python tooling caches (test, coverage, lint)
+.pytest_cache/
+.coverage
+htmlcov/
+.ruff_cache/
+
+# =============================================================================
+# Frontend / Node
+# =============================================================================
+frontend/node_modules/
+frontend/dist/
+# Generated frontend config (created by Terraform)
+frontend/public/config.json
+
+# =============================================================================
+# Terraform (all stacks)
+# =============================================================================
+**/.terraform/
+**/.terraform.lock.hcl
+**/*.tfstate
+**/*.tfstate.*
+**/*.tfplan
+**/*.tfvars.backup
+# Bare plan files at any depth (terraform -out=tfplan); the *.tfplan rule
+# above only matches the extension, so this catches extensionless `tfplan`.
+tfplan
+**/tfplan
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+backend.hcl
+terraform/*.zip
+terraform/.tflint.hcl
+
+# Terraform backend configs are account-specific (bucket name embeds the
+# account ID). Each developer creates their own from the committed template;
+# the real <env>.hcl files are never tracked.
+terraform/backends/*.hcl
+!terraform/backends/example.hcl.template
+
+# =============================================================================
+# Bedrock AgentCore
+# =============================================================================
+.bedrock_agentcore/
+.bedrock_agentcore.yaml
+.bedrock_agentcore.yaml.*
+# Shared runtime copied into agent dirs at deploy time (see deploy_agent.sh)
+agents/*/shared/
+# Pinned requirements exported from the `agents` dependency group at deploy time
+# (see deploy_agent.sh). Build artifact — the source of truth is pyproject.toml + uv.lock.
+agents/*/requirements.txt
+
+# =============================================================================
+# Build artifacts
+# =============================================================================
+# Lambda build artifacts
+.build/
+# load_document Lambda deps exported from the `load_document` group at build time
+# (see build_load_document.sh). Build artifact — source of truth is pyproject.toml + uv.lock.
+api/workflow/load_document_requirements.txt
+
+# =============================================================================
+# Generated tool output (Task runner, reports, ASH)
+# =============================================================================
+.task/
+.reports/
+
+# Automated Security Helper (ASH) — ignore outputs, but track the config
+.ash/*
+!.ash/.ash.yaml
+
+# =============================================================================
+# Generated docs & diagrams
+# =============================================================================
+# Generated API documentation
+api/docs/
+# PlantUML Diagrams
+documentation/diagrams
+
+# =============================================================================
+# Internal management docs (not tracked in repo)
+# =============================================================================
+CODE_MANAGEMENT.md
+PUBLISHING_RUNBOOK.md
+DEPLOYMENT.md
+pre-deploy-test.md

@@ -1,0 +1,16 @@
+# ShellCheck configuration — project shell baseline.
+#
+# Picked up automatically by `shellcheck` (CLI, pre-commit hook, editor
+# integrations) when run from the repo root.
+
+# Follow `source`d files so shared helpers (scripts/common.sh) are analyzed
+# instead of triggering "undefined variable/function" false positives.
+external-sources=true
+
+# Our scripts source helpers via dynamic paths — `$(dirname "$0")/common.sh`,
+# `${SCRIPT_DIR}/common.sh`, `${REPO_ROOT}/scripts/common.sh` — which ShellCheck
+# cannot resolve statically. Tell it where the sourced files actually live:
+#   SCRIPTDIR  — same directory as the script being checked (scripts/*.sh)
+#   scripts    — repo-root-relative, for scripts/utils/*.sh that source upward
+source-path=SCRIPTDIR
+source-path=scripts

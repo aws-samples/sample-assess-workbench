@@ -1,0 +1,965 @@
+# https://taskfile.dev
+version: '3'
+
+dotenv: ['.env']
+set: [pipefail]
+
+includes:
+  internal:
+    taskfile: ./Taskfile.internal.yml
+    optional: true
+
+vars:
+  # Environment selection and validation happen in scripts/utils/with-env.sh
+  # against the resolved $ENVIRONMENT (the shell value), never the Task
+  # {{.ENVIRONMENT}} template — which goes stale under a per-command
+  # `ENVIRONMENT=<env> task …` override.
+
+# AWS identity (AWS_PROFILE, AWS_ACCOUNT_ID) comes from .env, resolved and
+# account-guarded by scripts/utils/with-env.sh, which mutating tasks `source`
+# at the top of their command block. When AWS_ACCOUNT_ID is set, every deploy
+# asserts the live account matches before running; leave it unset to skip the
+# guard.
+
+tasks:
+
+  # ════════════════════════════════════════════════════════════════
+  # Full lifecycle
+  # ════════════════════════════════════════════════════════════════
+
+  deploy:
+    desc: Full deployment (backend + frontend + Cognito callback fixup)
+    aliases: [d]
+    cmds:
+      - task: deploy:backend
+      - task: deploy:frontend
+      # Second deploy:infra pass feeds the CloudFront URL back into Cognito
+      # callback URLs. This intentionally re-runs deploy:infra (run: always).
+      - task: deploy:infra
+      - |
+        export TF_DATA_DIR=".terraform/${ENVIRONMENT}"
+        FRONTEND_URL=$(terraform -chdir=terraform output -raw frontend_url 2>/dev/null || true)
+
+        echo ""
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "✓ Full deployment complete"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo ""
+        echo "Next steps:"
+        echo "  task deploy:user       Create a sign-in user (interactive)"
+        if [ -n "$FRONTEND_URL" ]; then
+          echo "  Log in:                ${FRONTEND_URL}"
+        else
+          echo "  task dev               Run the SPA locally at http://localhost:5173"
+        fi
+        echo ""
+        echo "  task status            (optional) endpoints + deployment status"
+
+  deploy:backend:
+    desc: Deploy backend infrastructure, agents, memory, KBs, and seed data
+    # Env validation is owned by with-env.sh (sourced by the mutating subtasks
+    # below — tf-bootstrap, deploy:infra). A bad ENVIRONMENT fails loudly there.
+    cmds:
+      - task: check:prereqs
+      - task: check:aws
+      - task: deploy:tf-bootstrap
+        vars:
+          NON_INTERACTIVE: "true"
+      - task: deploy:memory
+      - task: deploy:knowledge-bases
+      - task: deploy:agents
+      - task: build:layers
+      - task: deploy:infra
+      - task: deploy:agent-permissions
+      - task: deploy:seed
+      - |
+        echo ""
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "✓ Backend deployed"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+  destroy:
+    desc: Full teardown (removes all AWS resources)
+    # Env validation is owned by with-env.sh (sourced by destroy:infra:run). A
+    # bad ENVIRONMENT fails loudly there before anything is destroyed.
+    prompt: ⚠️  This will DELETE all infrastructure, agents, and data. Continue?
+    cmds:
+      - task: check:aws
+      # Call internal :run tasks directly to skip sub-task prompts.
+      # The parent prompt above is the single confirmation gate.
+      - task: destroy:infra:run
+      - task: destroy:knowledge-bases:run
+      - task: destroy:memory:run
+      - task: destroy:agents:run
+      - task: destroy:ssm:run
+      - |
+        echo ""
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "✓ Full teardown complete"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo ""
+        echo "Destroyed: infrastructure, knowledge bases, memory, agents, SSM parameters"
+        echo "Preserved: Terraform backend (S3 state bucket, DynamoDB lock table)"
+        echo ""
+        echo "To redeploy:  task deploy"
+
+  # ════════════════════════════════════════════════════════════════
+  # Checks
+  # ════════════════════════════════════════════════════════════════
+
+  check:prereqs:
+    desc: Validate all prerequisites are installed
+    run: once
+    silent: true
+    cmds:
+      - |
+        echo "Checking prerequisites..."
+        echo ""
+        MISSING=0
+
+        # Python
+        if command -v python3 &>/dev/null; then
+          echo "✓ Python $(python3 --version 2>&1 | awk '{print $2}')"
+        else
+          echo "✗ Python 3.13+ — https://www.python.org/downloads/"
+          MISSING=1
+        fi
+
+        # uv
+        if command -v uv &>/dev/null; then
+          echo "✓ uv $(uv --version 2>&1 | awk '{print $2}')"
+        else
+          echo "✗ uv — https://docs.astral.sh/uv/getting-started/installation/"
+          MISSING=1
+        fi
+
+        # AgentCore CLI
+        if command -v agentcore &>/dev/null; then
+          echo "✓ agentcore CLI"
+        else
+          echo "✗ agentcore CLI — uv tool install bedrock-agentcore-starter-toolkit"
+          MISSING=1
+        fi
+
+        # Terraform
+        if command -v terraform &>/dev/null; then
+          echo "✓ Terraform $(terraform version -json 2>/dev/null | python3 -c 'import sys,json; print(json.load(sys.stdin)["terraform_version"])' 2>/dev/null || echo '(version unknown)')"
+        else
+          echo "✗ Terraform 1.5+ — https://developer.hashicorp.com/terraform/install"
+          MISSING=1
+        fi
+
+        # AWS CLI
+        if command -v aws &>/dev/null; then
+          echo "✓ AWS CLI $(aws --version 2>&1 | awk '{print $1}' | cut -d/ -f2)"
+        else
+          echo "✗ AWS CLI — https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html"
+          MISSING=1
+        fi
+
+        # Node.js
+        if command -v node &>/dev/null; then
+          echo "✓ Node.js $(node --version)"
+        else
+          echo "✗ Node.js 18+ — https://nodejs.org/"
+          MISSING=1
+        fi
+
+        echo ""
+        if [ "$MISSING" -eq 1 ]; then
+          echo "❌ Some prerequisites are missing. Install them and try again."
+          exit 1
+        fi
+        echo "All prerequisites installed ✓"
+
+  check:aws:
+    desc: Validate AWS credentials are configured
+    run: once
+    silent: true
+    cmds:
+      - |
+        # Resolve the environment's AWS_PROFILE/account (env.d or .env) so the
+        # gate checks the same identity the deploy will use, not an ambient one.
+        source scripts/utils/with-env.sh
+        echo "Checking AWS credentials..."
+        if ! aws sts get-caller-identity --region {{.AWS_REGION}} &>/dev/null; then
+          echo ""
+          echo "❌ AWS credentials not configured or expired."
+          echo ""
+          echo "Configure credentials using one of:"
+          echo "  • AWS SSO:       aws sso login --profile <profile>"
+          echo "  • AWS Profile:   export AWS_PROFILE=<profile>"
+          echo "  • Isengard CLI:  isengardcli add-profile --profile <profile>"
+          echo "  • Environment:   export AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=..."
+          echo "  • aws configure: aws configure"
+          echo ""
+          echo "Then re-run: task deploy"
+          exit 1
+        fi
+
+        ACCOUNT=$(aws sts get-caller-identity --region {{.AWS_REGION}} --query 'Account' --output text)
+        ARN=$(aws sts get-caller-identity --region {{.AWS_REGION}} --query 'Arn' --output text)
+        echo "✓ AWS credentials valid"
+        echo "  Region:  {{.AWS_REGION}}"
+        echo "  Account: ${ACCOUNT}"
+        echo "  Role:    ${ARN}"
+
+  check:env:
+    desc: Validate .env file exists and required variables are set
+    # Internal: only ever run as a dep of deploy/destroy tasks, never invoked
+    # directly (unlike check:prereqs / check:aws, which SETUP.md documents).
+    internal: true
+    run: once
+    silent: true
+    cmds:
+      - |
+        if [ ! -f .env ]; then
+          echo "❌ No .env file found"
+          echo ""
+          echo "Create one from the example:"
+          echo "  cp .env.example .env"
+          echo ""
+          echo "Then edit it with your settings."
+          exit 1
+        fi
+
+        MISSING=0
+        for VAR in AWS_REGION ENVIRONMENT PROJECT_NAME PYTHON_RUNTIME PLANNER_MODEL_ID JUDGE_MODEL_ID IMAGE_ANALYSIS_MODEL_ID; do
+          if [ -z "${!VAR}" ]; then
+            echo "❌ ${VAR} is not set in .env"
+            MISSING=1
+          fi
+        done
+
+        if [ "$MISSING" -eq 1 ]; then
+          echo ""
+          echo "Add missing variables to .env (see .env.example)"
+          exit 1
+        fi
+        echo "✓ .env file valid"
+
+  # ════════════════════════════════════════════════════════════════
+  # Deploy targets
+  # ════════════════════════════════════════════════════════════════
+
+  deploy:tf-bootstrap:
+    desc: Create Terraform remote backend (S3 + DynamoDB + KMS) in the current account
+    deps: [check:env, check:aws]
+    silent: true
+    cmds:
+      - |
+        # with-env.sh resolves $ENVIRONMENT and — when AWS_ACCOUNT_ID is set —
+        # asserts the live account matches before we create any backend
+        # resources.
+        source scripts/utils/with-env.sh
+
+        ACCOUNT=$(aws sts get-caller-identity --region "${AWS_REGION}" --query 'Account' --output text)
+
+        # Optional interactive confirmation for shared accounts. The account
+        # *equality* check is owned by with-env.sh (above); this prompt only
+        # adds a human gate before mutating a shared account's backend.
+        SHARED_ACCOUNT="${SHARED_ACCOUNT:-no}"
+        if [ "$SHARED_ACCOUNT" = "yes" ]; then
+          echo "⚠️  This is a shared account ($ACCOUNT) for environment '${ENVIRONMENT}'"
+          echo "   Creating backend resources: S3 bucket, DynamoDB table, KMS key"
+          if [ "{{.NON_INTERACTIVE}}" = "true" ]; then
+            echo "   (auto-confirmed — running as part of full deploy pipeline)"
+          else
+            read -p "   Continue? [y/N] " CONFIRM
+            if [ "$CONFIRM" != "y" ] && [ "$CONFIRM" != "Y" ]; then
+              echo "Aborted."
+              exit 1
+            fi
+          fi
+        fi
+
+        echo ""
+        echo "Creating Terraform backend in account ${ACCOUNT} (${ENVIRONMENT})..."
+        echo ""
+
+        # Run the setup script — it's idempotent (skips existing resources)
+        bash scripts/utils/setup-terraform-backend.sh
+
+  deploy:memory:
+    desc: Deploy shared semantic memory resource
+    deps: [check:env]
+    cmds:
+      - |
+        source scripts/utils/with-env.sh
+        bash scripts/deploy_shared_memory.sh
+
+  deploy:knowledge-bases:
+    desc: Deploy Document Index and Standards Knowledge Bases
+    deps: [check:env]
+    cmds:
+      - |
+        source scripts/utils/with-env.sh
+        set -e
+        bash scripts/deploy_document_kb.sh
+        bash scripts/deploy_standards_kb.sh
+
+  deploy:agents:
+    desc: Deploy all agents (review + chat) to AgentCore
+    deps: [check:env]
+    cmds:
+      - |
+        source scripts/utils/with-env.sh
+        set -e
+        # Re-point the .bedrock_agentcore.yaml symlink at the resolved env before
+        # the CLI runs, so configure/deploy write through to the right canonical
+
+        # per-env file, derived per-invocation from $ENVIRONMENT.
+        bash scripts/agentcore_config.sh link
+        bash scripts/deploy_agent.sh all
+        bash scripts/agentcore_config.sh backup
+
+  deploy:agent:
+    desc: "Deploy agent(s) (usage: task deploy:agent -- <name|review|chat|all>)"
+    deps: [check:env]
+    cmds:
+      - |
+        source scripts/utils/with-env.sh
+        set -e
+        # Re-point the symlink at the resolved env before the CLI runs (see
+        # deploy:agents).
+        bash scripts/agentcore_config.sh link
+        bash scripts/deploy_agent.sh {{.CLI_ARGS}}
+        bash scripts/agentcore_config.sh backup
+
+  deploy:agent-permissions:
+    desc: Grant agent execution roles required IAM permissions (registry + memory)
+    deps: [check:env]
+    cmds:
+      - |
+        source scripts/utils/with-env.sh
+        bash scripts/grant_agent_permissions.sh
+
+  deploy:seed:
+    desc: Seed agent registry in DynamoDB
+    deps: [check:env]
+    cmds:
+      - |
+        source scripts/utils/with-env.sh
+        bash scripts/seed_agent_registry.sh
+
+  deploy:infra:
+    desc: Deploy infrastructure via Terraform
+    deps: [check:env, build:api-docs]
+    dir: terraform
+    cmds:
+      # One command block so the sourced env guard's exports reach both the
+      # init and apply that follow. Path is ../ because dir: terraform.
+      - |
+        source ../scripts/utils/with-env.sh
+
+        # Per-environment Terraform data dir: each env re-inits in isolation
+        # (provider cache + backend pointer) instead of sharing one .terraform/
+        # that a forgotten switch could leave pointed at the wrong account.
+        # Remote state lives in S3, so this is re-init only — no state moves.
+        # Relative to terraform/ because dir: terraform.
+        export TF_DATA_DIR=".terraform/${ENVIRONMENT}"
+
+        # OIDC client secret → TF_VAR (env, not argv, so it never appears in the
+        # process list). The identity provider is created only when this is
+        # non-empty; with no secret file present, federation stays off (the
+        # default). Path is ../ because dir: terraform.
+        if [ -f ../oidc_client_secret ]; then
+          TF_VAR_federated_client_secret="$(tr -d '\n' < ../oidc_client_secret)"
+          export TF_VAR_federated_client_secret
+        fi
+
+        terraform init -upgrade -reconfigure -backend-config="backends/${ENVIRONMENT}.hcl"
+
+        # Auto-populate cloudfront_url from prior deploy if available.
+        # This breaks the Cognito ↔ CloudFront dependency cycle: the first
+        # deploy creates the distribution, subsequent deploys feed its URL
+        # back into Cognito callback URLs and CORS origins.
+        #
+        # Terraform -raw prints a "No outputs found" warning to stdout (not
+        # stderr) on empty state and exits 0 — a known bug (hashicorp/terraform
+        # #32384). Piping through grep ensures CF_URL is only set when the
+        # output is an actual URL. On first deploy this is empty (no prior
+        # CloudFront distribution), which is fine.
+        CF_URL=$(terraform output -raw frontend_url 2>/dev/null | grep -E '^https://' || true)
+        CF_VAR=""
+        if [ -n "$CF_URL" ]; then
+          CF_VAR="-var=cloudfront_url=${CF_URL}"
+        fi
+
+        terraform apply \
+          -var-file="environments/${ENVIRONMENT}.tfvars" \
+          -var="project_name=${PROJECT_NAME}" \
+          -var="aws_region=${AWS_REGION}" \
+          -var="environment=${ENVIRONMENT}" \
+          -var="planner_model_id={{.PLANNER_MODEL_ID}}" \
+          -var="judge_model_id={{.JUDGE_MODEL_ID}}" \
+          -var="image_analysis_model_id={{.IMAGE_ANALYSIS_MODEL_ID}}" \
+          ${CF_VAR} \
+          -auto-approve
+
+  deploy:frontend:
+    desc: Build and deploy the frontend to S3 + invalidate CloudFront
+    deps: [check:aws, build:frontend]
+    cmds:
+      - bash scripts/deploy_frontend.sh
+
+  deploy:user:
+    desc: Create a Cognito user with permanent password and group assignment
+    interactive: true
+    silent: true
+    cmds:
+      - bash scripts/deploy_user.sh
+
+  # ════════════════════════════════════════════════════════════════
+  # Build targets
+  # ════════════════════════════════════════════════════════════════
+
+  build:layers:
+    desc: Build Lambda layers (dependencies + core)
+    deps: [build:dependencies-layer, build:core-layer, build:load-document]
+
+  build:dependencies-layer:
+    desc: Build dependencies Lambda layer (boto3, python-jose)
+    cmds:
+      - bash scripts/build_dependencies_layer.sh
+    sources:
+      - scripts/build_dependencies_layer.sh
+      - pyproject.toml
+      - uv.lock
+    generates:
+      - .build/dependencies_layer/python/**/*
+
+  build:core-layer:
+    desc: Build core Lambda layer (shared application code)
+    cmds:
+      - bash scripts/build_core_layer.sh
+    sources:
+      - scripts/build_core_layer.sh
+      - api/core/**/*.py
+    generates:
+      - .build/core_layer/python/**/*
+
+  build:load-document:
+    desc: Build load_document Lambda package
+    cmds:
+      - bash scripts/build_load_document.sh
+    sources:
+      - scripts/build_load_document.sh
+      - api/workflow/load_document.py
+      - pyproject.toml
+      - uv.lock
+    generates:
+      - .build/load_document/**/*
+
+  build:api-docs:
+    desc: Generate API reference docs from OpenAPI spec
+    cmds:
+      - python3 scripts/generate_api_docs.py
+    sources:
+      - api/openapi.yaml
+      - scripts/generate_api_docs.py
+    generates:
+      - frontend/src/docs/api-reference.md
+
+  build:frontend:
+    desc: Build the frontend SPA for production (outputs to frontend/dist)
+    dir: frontend
+    deps: [frontend:config]
+    cmds:
+      - npm ci
+      - npm run build
+    sources:
+      - src/**/*
+      - package.json
+      - package-lock.json
+      - vite.config.js
+    generates:
+      - dist/**/*
+
+  frontend:config:
+    desc: Regenerate frontend/public/config.json from Terraform outputs for the resolved env
+    silent: true
+    cmds:
+      - |
+        source scripts/utils/with-env.sh
+        export TF_DATA_DIR=".terraform/${ENVIRONMENT}"
+
+        # config.json is the canonical Terraform output frontend_config_json.
+        # When the output is absent (env not yet deployed), leave any existing
+        # config.json untouched so a UI-only `task dev` is not blocked.
+        CONFIG=$(terraform -chdir=terraform output -raw frontend_config_json 2>/dev/null || true)
+        if [ -z "$CONFIG" ]; then
+          echo "⚠️  No Terraform output for '${ENVIRONMENT}' — config.json left unchanged."
+          echo "   Run 'task deploy:infra' if the app needs a backend."
+          exit 0
+        fi
+
+        printf '%s\n' "$CONFIG" > frontend/public/config.json
+        echo "✓ frontend/public/config.json regenerated for ${ENVIRONMENT}"
+
+  # ════════════════════════════════════════════════════════════════
+  # Destroy targets
+  # ════════════════════════════════════════════════════════════════
+
+  destroy:infra:
+    desc: Destroy Terraform-managed infrastructure
+    prompt: This will delete all AWS infrastructure (API Gateway, Lambda, DynamoDB, Cognito, etc). Continue?
+    cmds:
+      - task: destroy:infra:run
+
+  destroy:infra:run:
+    internal: true
+    silent: true
+    dir: terraform
+    cmds:
+      # One command block so the sourced env guard's exports reach both the
+      # init and destroy that follow. Path is ../ because dir: terraform.
+      - |
+        source ../scripts/utils/with-env.sh
+
+        # Per-environment Terraform data dir (see deploy:infra). Re-init only;
+        # remote state lives in S3. Relative to terraform/ because dir: terraform.
+        export TF_DATA_DIR=".terraform/${ENVIRONMENT}"
+
+        terraform init -reconfigure -backend-config="backends/${ENVIRONMENT}.hcl"
+
+        # See deploy:infra for why grep is needed here (terraform #32384).
+        CF_URL=$(terraform output -raw frontend_url 2>/dev/null | grep -E '^https://' || true)
+        CF_VAR=""
+        if [ -n "$CF_URL" ]; then
+          CF_VAR="-var=cloudfront_url=${CF_URL}"
+        fi
+
+        terraform destroy \
+          -var-file="environments/${ENVIRONMENT}.tfvars" \
+          -var="project_name=${PROJECT_NAME}" \
+          -var="aws_region=${AWS_REGION}" \
+          -var="environment=${ENVIRONMENT}" \
+          -var="planner_model_id={{.PLANNER_MODEL_ID}}" \
+          -var="judge_model_id={{.JUDGE_MODEL_ID}}" \
+          -var="image_analysis_model_id={{.IMAGE_ANALYSIS_MODEL_ID}}" \
+          ${CF_VAR} \
+          -auto-approve
+
+  destroy:knowledge-bases:
+    desc: Delete Knowledge Bases, vector stores, and associated IAM roles
+    prompt: This will delete all Knowledge Bases and their vector indexes. Continue?
+    cmds:
+      - task: destroy:knowledge-bases:run
+
+  destroy:knowledge-bases:run:
+    internal: true
+    silent: true
+    deps: [check:env]
+    cmds:
+      - |
+        source scripts/utils/with-env.sh
+        bash scripts/destroy_knowledge_bases.sh
+
+  destroy:agents:
+    desc: Delete all AgentCore agents
+    prompt: This will delete all deployed agents from AgentCore. Continue?
+    cmds:
+      - task: destroy:agents:run
+
+  destroy:agents:run:
+    internal: true
+    silent: true
+    cmds:
+      - bash scripts/destroy_agents.sh
+
+  destroy:memory:
+    desc: Delete the shared semantic memory for this project
+    # Per-agent chat memories are owned by their agent runtime and are removed
+    # by `agentcore destroy` (destroy:agents) — not here.
+    prompt: This will delete the shared semantic memory. Continue?
+    cmds:
+      - task: destroy:memory:run
+
+  destroy:memory:run:
+    internal: true
+    silent: true
+    cmds:
+      - bash scripts/destroy_memory.sh
+
+  destroy:ssm:
+    desc: Clean up SSM parameters
+    prompt: This will delete all SSM parameters under /{{.PROJECT_NAME}}/<resolved-env>/. Continue?
+    cmds:
+      - task: destroy:ssm:run
+
+  destroy:ssm:run:
+    internal: true
+    silent: true
+    cmds:
+      - bash scripts/destroy_ssm.sh
+
+  destroy:backend:
+    desc: "Delete the preserved Terraform backend (state bucket, lock table, KMS alias). DESTRUCTIVE — dedicated/throwaway account only."
+    prompt: ⚠️  Deletes the Terraform state bucket, lock table, and the ACCOUNT-LEVEL alias/terraform-state KMS alias. For a dedicated canary/throwaway account, NOT dev/demo. Continue?
+    cmds:
+      - bash scripts/utils/destroy-terraform-backend.sh
+
+  verify:clean:
+    desc: "Verify this env is fully torn down (read-only). Use -- --include-backend after destroy:backend."
+    silent: true
+    cmds:
+      - |
+        source scripts/utils/with-env.sh
+        bash scripts/utils/verify_clean.sh {{.CLI_ARGS}}
+
+  # ════════════════════════════════════════════════════════════════
+  # Environment
+  #
+  #   task env                       Show the resolved environment + account.
+  #   ENVIRONMENT=<env> task <name>  Target a specific environment per-command.
+  #
+  # ENVIRONMENT is read from .env (the default target) and can be overridden
+  # per-command. AWS identity (AWS_PROFILE, AWS_ACCOUNT_ID) comes from .env and
+  # is resolved + account-guarded by with-env.sh. There is no persisted
+  # "current environment" mode.
+  # ════════════════════════════════════════════════════════════════
+
+  env:
+    desc: Show current environment, profile, and AWS account
+    silent: true
+    cmds:
+      - |
+        # Resolve + guard via the single source of truth, then report the
+        # values the helper actually resolved — never the {{.ENVIRONMENT}} /
+        # {{.AWS_PROFILE}} templates, which go stale under a per-command override.
+        source scripts/utils/with-env.sh
+
+        BRANCH=$(git branch --show-current 2>/dev/null || echo "unknown")
+        DISPLAY_PROFILE="${AWS_PROFILE:-[default]}"
+        ACCOUNT=$(aws sts get-caller-identity --region {{.AWS_REGION}} \
+          --query 'Account' --output text 2>/dev/null || echo "credentials expired")
+
+        echo ""
+        echo "  Environment:  ${ENVIRONMENT}"
+        echo "  AWS Profile:  ${DISPLAY_PROFILE}"
+        echo "  Git Branch:   ${BRANCH}"
+        echo "  Account:      ${ACCOUNT}"
+        echo ""
+
+  # ════════════════════════════════════════════════════════════════
+  # AgentCore config management
+  # ════════════════════════════════════════════════════════════════
+
+  agentcore:backup:
+    desc: Back up .bedrock_agentcore.yaml to S3 and local timestamped copy
+    deps: [check:env, check:aws]
+    cmds:
+      - |
+        source scripts/utils/with-env.sh
+        set -e
+        # Re-point at the resolved env first so we back up the right config.
+        bash scripts/agentcore_config.sh link
+        bash scripts/agentcore_config.sh backup
+
+  agentcore:restore:
+    desc: "Restore .bedrock_agentcore.yaml from S3 (usage: task agentcore:restore [-- <env>])"
+    deps: [check:env, check:aws]
+    cmds:
+      - |
+        source scripts/utils/with-env.sh
+        set -e
+        # Re-point first so the restore writes through the symlink into the
+        # resolved env's canonical .bedrock_agentcore.yaml.<env> file.
+        bash scripts/agentcore_config.sh link
+        bash scripts/agentcore_config.sh restore {{.CLI_ARGS}}
+
+  agentcore:backups:
+    desc: List available AgentCore config backups (local + S3)
+    cmds:
+      - |
+        source scripts/utils/with-env.sh
+        bash scripts/agentcore_config.sh list
+
+  # ════════════════════════════════════════════════════════════════
+  # User management
+  # ════════════════════════════════════════════════════════════════
+
+  user:group:
+    desc: "Change a user's Cognito group (usage: task user:group -- <email> <group>)"
+    deps: [check:aws]
+    silent: true
+    cmds:
+      - bash scripts/user_group.sh "{{.CLI_ARGS}}"
+
+  # ════════════════════════════════════════════════════════════════
+  # Development
+  # ════════════════════════════════════════════════════════════════
+
+  dev:
+    desc: Start frontend dev server (Vite)
+    dir: frontend
+    deps: [frontend:config]
+    cmds:
+      - npm install
+      - npm run dev
+
+  lint:
+    desc: Run code quality checks (Python, frontend, Terraform) and save report
+    silent: true
+    cmds:
+      - |
+        mkdir -p .reports
+        REPORT=".reports/code-quality.txt"
+        echo "Code Quality Report — $(date '+%Y-%m-%d %H:%M:%S')" > "$REPORT"
+        echo "=================================================" >> "$REPORT"
+        EXIT=0
+        SKIPPED=""
+
+        # ── Python ──
+
+        echo ""
+        echo "Running ruff..."
+        echo "" >> "$REPORT"
+        echo "── ruff (linting) ──────────────────────────────" >> "$REPORT"
+        uv run ruff check . >> "$REPORT" 2>&1 || EXIT=1
+        echo "" >> "$REPORT"
+        echo "── ruff format (formatting drift, report-only) ──" >> "$REPORT"
+        uv run ruff format --check . >> "$REPORT" 2>&1 || EXIT=1
+        echo "  Done."
+
+        echo "Running vulture..."
+        echo "" >> "$REPORT"
+        echo "── vulture (dead code) ─────────────────────────" >> "$REPORT"
+        vulture . --min-confidence 80 --exclude ".venv,.build,.bedrock_agentcore,__pycache__,.pytest_cache" >> "$REPORT" 2>&1 || EXIT=1
+        echo "  Done."
+
+        echo "Running radon..."
+        echo "" >> "$REPORT"
+        echo "── radon (complexity) ──────────────────────────" >> "$REPORT"
+        radon cc . -a -nb --exclude ".venv,__pycache__,.build,.bedrock_agentcore,node_modules" >> "$REPORT" 2>&1
+        echo "  Done."
+
+        # ── Frontend ──
+
+        echo "Running eslint (frontend)..."
+        echo "" >> "$REPORT"
+        echo "── eslint (frontend linting) ───────────────────" >> "$REPORT"
+        (cd frontend && npx eslint src/) >> "$REPORT" 2>&1 || EXIT=1
+        echo "  Done."
+
+        echo "Running knip (frontend dead code)..."
+        echo "" >> "$REPORT"
+        echo "── knip (frontend unused code/deps) ─────────────" >> "$REPORT"
+        (cd frontend && npx knip) >> "$REPORT" 2>&1 || EXIT=1
+        echo "  Done."
+
+        if command -v jscpd &>/dev/null; then
+          echo "Running jscpd (duplication)..."
+          echo "" >> "$REPORT"
+          echo "── jscpd (code duplication) ─────────────────────" >> "$REPORT"
+          jscpd --min-lines 10 --ignore "**/.venv/**,**/node_modules/**,**/.build/**,**/.bedrock_agentcore/**,**/dist/**,**/__pycache__/**,**/.terraform/**,**/.ash/**" . >> "$REPORT" 2>&1 || EXIT=1
+          echo "  Done."
+        else
+          SKIPPED="${SKIPPED}  • jscpd (code duplication) — install: npm install -g jscpd\n"
+        fi
+
+        # ── Terraform ──
+
+        echo "Running terraform fmt..."
+        echo "" >> "$REPORT"
+        echo "── terraform fmt (formatting) ───────────────────" >> "$REPORT"
+        terraform fmt -check -recursive terraform/ >> "$REPORT" 2>&1 || EXIT=1
+        echo "  Done."
+
+        if command -v tflint &>/dev/null; then
+          echo "Running tflint..."
+          echo "" >> "$REPORT"
+          echo "── tflint (Terraform linting) ─────────────────" >> "$REPORT"
+          (cd terraform && tflint --recursive --config "$(pwd)/.tflint.hcl") >> "$REPORT" 2>&1 || EXIT=1
+          echo "  Done."
+        else
+          SKIPPED="${SKIPPED}  • tflint (Terraform linting) — install: brew install tflint\n"
+        fi
+
+        # ── Summary ──
+
+        echo ""
+        echo "Report saved to ${REPORT}"
+        if [ -n "$SKIPPED" ]; then
+          echo ""
+          echo "Skipped (not installed):"
+          echo -e "$SKIPPED"
+        fi
+        if [ "$EXIT" -ne 0 ]; then
+          echo "⚠️  Some checks reported findings — see report for details."
+        else
+          echo "✓ All checks passed."
+        fi
+
+  precommit:
+    desc: Run all pre-commit hooks against every file (same as CI)
+    cmds:
+      - uv run pre-commit run --all-files
+
+  precommit:install:
+    desc: Install the pre-commit git hooks (pre-commit + pre-push)
+    silent: true
+    cmds:
+      - |
+        # GIT_CONFIG=/dev/null lets pre-commit install even when a system
+        # `core.hooksPath` is configured (managed-machine setups). With no such
+        # path it installs into .git/hooks normally — safe in both cases.
+        GIT_CONFIG=/dev/null uv run pre-commit install --hook-type pre-commit --hook-type pre-push
+        echo "✓ pre-commit + pre-push hooks installed (.git/hooks/)"
+
+  scan:
+    desc: Run ASH security scan (Bandit, Checkov, Semgrep, detect-secrets)
+    cmds:
+      # Pin a release tag, not `@v3` (that tag tracks ASH's `main` — unreleased dev).
+      # renovate: datasource=github-releases depName=awslabs/automated-security-helper
+      - uvx git+https://github.com/awslabs/automated-security-helper.git@v3.5.4 scan
+
+  test:
+    desc: Run Python unit tests (no AWS credentials needed)
+    aliases: [t]
+    cmds:
+      - uv run pytest tests/unit -v
+
+  test:frontend:
+    desc: Run frontend unit tests (vitest)
+    dir: frontend
+    cmds:
+      - npm test
+
+  test:live:
+    desc: Run live tests (review lifecycle + API + WebSocket)
+    deps: [check:aws]
+    cmds:
+      - |
+        source scripts/utils/with-env.sh
+        # Endpoint discovery reads Terraform outputs, which live under the
+        # env-scoped data dir; without this the outputs resolve empty and every
+        # live test skips as "no endpoints configured".
+        export TF_DATA_DIR=".terraform/${ENVIRONMENT}"
+        uv run pytest tests/live -v -s {{.CLI_ARGS}}
+
+  test:all:
+    desc: Run all tests (unit + live)
+    cmds:
+      - |
+        source scripts/utils/with-env.sh
+        uv run pytest tests -v -s {{.CLI_ARGS}}
+
+  test:project-id:
+    desc: List completed projects to find a TEST_PROJECT_ID for chat tests
+    deps: [check:aws]
+    silent: true
+    cmds:
+      - |
+        source scripts/utils/with-env.sh
+        export TF_DATA_DIR=".terraform/${ENVIRONMENT}"
+        uv run python3 -c "
+        import boto3, os, json, subprocess
+
+        region = os.environ.get('AWS_REGION', 'us-west-2')
+
+        # Get Cognito client ID and API endpoint from Terraform
+        def tf_output(key):
+            r = subprocess.run(['terraform', 'output', '-raw', key],
+                               cwd='terraform', capture_output=True, text=True)
+            return r.stdout.strip()
+
+        client_id = os.environ.get('COGNITO_CLIENT_ID', '') or tf_output('cognito_client_id')
+        api_endpoint = os.environ.get('API_ENDPOINT', '') or tf_output('api_endpoint')
+        email = os.environ.get('TEST_USER_EMAIL', '')
+        password = os.environ.get('TEST_USER_PASSWORD', '')
+
+        if not all([email, password, client_id]):
+            print('Set TEST_USER_EMAIL and TEST_USER_PASSWORD first.')
+            exit(1)
+
+        # Get token
+        cognito = boto3.client('cognito-idp', region_name=region)
+        token = cognito.initiate_auth(
+            ClientId=client_id, AuthFlow='USER_PASSWORD_AUTH',
+            AuthParameters={'USERNAME': email, 'PASSWORD': password},
+        )['AuthenticationResult']['IdToken']
+
+        # List completed projects
+        import requests
+        resp = requests.get(f'{api_endpoint}/projects',
+                            params={'status': 'completed'},
+                            headers={'Authorization': f'Bearer {token}'}, timeout=15)
+        projects = resp.json().get('projects', [])
+
+        if not projects:
+            print('No completed projects found. Run a review first.')
+            exit(1)
+
+        print(f'Completed projects ({len(projects)}):')
+        print()
+        for p in projects[:10]:
+            print(f'  {p[\"project_id\"]}  {p[\"name\"]}')
+        print()
+        print(f'Usage:  export TEST_PROJECT_ID=\"{projects[0][\"project_id\"]}\"')
+        "
+
+  # ════════════════════════════════════════════════════════════════
+  # Info
+  # ════════════════════════════════════════════════════════════════
+
+  status:
+    desc: Show deployment status and endpoints
+    aliases: [s]
+    dir: terraform
+    silent: true
+    cmds:
+      - |
+        source ../scripts/utils/with-env.sh
+        export TF_DATA_DIR=".terraform/${ENVIRONMENT}"
+
+        echo "=================================="
+        echo "Deployment Status"
+        echo "=================================="
+        echo ""
+        echo "Environment: ${ENVIRONMENT}"
+        echo "Region:      {{.AWS_REGION}}"
+        echo ""
+
+        # Terraform outputs
+        API=$(terraform output -raw api_endpoint 2>/dev/null || echo "not deployed")
+        WS=$(terraform output -raw websocket_url 2>/dev/null || echo "not deployed")
+        COGNITO=$(terraform output -raw cognito_hosted_ui_url 2>/dev/null || echo "not deployed")
+        echo "HTTP API:    ${API}"
+        echo "WebSocket:   ${WS}"
+        echo "Cognito:     ${COGNITO}"
+        echo ""
+
+        # Sign-in entry point — the hosted SPA, not the raw Cognito URL.
+        # frontend_url is always defined; it is empty when deploy_frontend = false.
+        FRONTEND=$(terraform output -raw frontend_url 2>/dev/null)
+        if [ -n "$FRONTEND" ]; then
+          echo "➜ Sign in here: ${FRONTEND}"
+          echo "  Log in with a Cognito user — create one via 'task deploy:user'."
+        else
+          echo "Frontend hosting is disabled (deploy_frontend = false)."
+          echo "Run 'task dev' for the local SPA at http://localhost:5173."
+        fi
+        echo ""
+
+        # Agents — query the control plane directly. The agentcore CLI has no
+        # top-level 'list' command, and live runtime state lives in AWS, not in
+        # the local .bedrock_agentcore.yaml.
+        echo "Agents:"
+        AGENTS=$(aws bedrock-agentcore-control list-agent-runtimes \
+          --region {{.AWS_REGION}} \
+          --query 'agentRuntimes[].[agentRuntimeName,status]' \
+          --output text 2>/dev/null)
+        if [ -n "$AGENTS" ]; then
+          echo "$AGENTS" | while IFS=$'\t' read -r NAME STATUS; do
+            printf "  %-26s %s\n" "$NAME" "$STATUS"
+          done
+        else
+          echo "  (none deployed)"
+        fi
+        echo ""
+
+        # Memory
+        echo "Memory:"
+        agentcore memory list --region {{.AWS_REGION}} 2>/dev/null | grep "${PROJECT_NAME//-/_}_shared_memory" || echo "  (none)"

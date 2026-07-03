@@ -1,0 +1,51 @@
+name: architect
+role: review
+ssm_key: agent/architect_arn
+
+registry:
+  agent_type: architecture
+  display_name: Architecture
+  icon: "🏗️"
+  color: "#00a8e8"
+  description: "Reviews software architecture, design patterns, scalability, performance, maintainability"
+  category: technical
+  sort_order: 1
+  default_depth: ""
+  chat_agent: architect_chat
+  model_id: global.anthropic.claude-sonnet-4-6
+  tool_limits:
+    search_document: 5
+    get_prior_findings: 4
+    lookup_standard: 3
+  judge_defaults:
+    max_iterations: 2
+    quality_threshold: 0.7
+    coach_enabled: true
+  finding_schema:
+    severity_levels: [high, medium, low]
+    severity_source: direct
+    primary_fields: [quality_attribute, impact_type, affected_components]
+    optional_fields: []
+    display_strategy: quality_attribute
+    fields:
+      quality_attribute:
+        type: str
+        required: true
+        description: "ATAM quality attribute: performance, modifiability, availability, security, usability, testability, interoperability, deployability"
+        enum: [performance, modifiability, availability, security, usability, testability, interoperability, deployability]
+        display: badge
+        color: cyan
+      impact_type:
+        type: str
+        required: true
+        description: "Finding type: risk, sensitivity_point, tradeoff, recommendation"
+        enum: [risk, sensitivity_point, tradeoff, recommendation]
+        display: badge
+        color: amber
+      affected_components:
+        type: "list[str]"
+        required: false
+        default: []
+        description: "Specific system components affected (e.g., 'API Gateway', 'Auth Service')"
+        display: section
+        color: blue

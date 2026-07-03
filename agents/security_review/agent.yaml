@@ -1,0 +1,67 @@
+name: security_architect
+role: review
+ssm_key: agent/security_architect_arn
+
+registry:
+  agent_type: security
+  display_name: Security
+  icon: "🔒"
+  color: "#28a745"
+  description: "Reviews authentication, data protection, network security, compliance, vulnerabilities"
+  category: technical
+  sort_order: 2
+  default_depth: ""
+  chat_agent: security_chat
+  model_id: global.anthropic.claude-sonnet-4-6
+  tool_limits:
+    search_document: 5
+    get_prior_findings: 4
+    lookup_standard: 3
+  judge_defaults:
+    max_iterations: 2
+    quality_threshold: 0.7
+    coach_enabled: true
+  finding_schema:
+    severity_levels: [critical, high, medium, low]
+    severity_source: direct
+    primary_fields: [owasp_category, cwe_id, compliance_refs]
+    optional_fields: [attack_vector, exploitability]
+    display_strategy: severity_badge_with_tags
+    fields:
+      owasp_category:
+        type: str
+        required: false
+        default: ""
+        description: "OWASP Top 10 category if applicable (e.g., 'A01:2021 Broken Access Control')"
+        display: badge
+        color: red
+      cwe_id:
+        type: str
+        required: false
+        default: ""
+        description: "CWE identifier if applicable (e.g., 'CWE-287')"
+        display: badge
+        color: deep-orange
+      compliance_refs:
+        type: "list[str]"
+        required: false
+        default: []
+        description: "Relevant compliance references (e.g., 'GDPR Art.32', 'SOC2 CC6.1')"
+        display: tag_list
+        color: blue
+      attack_vector:
+        type: str
+        required: false
+        default: ""
+        description: "CVSS-aligned attack vector: network, adjacent, local, physical"
+        enum: [network, adjacent, local, physical]
+        display: badge
+        color: amber
+      exploitability:
+        type: str
+        required: false
+        default: ""
+        description: "Simplified exploitability: low, medium, high"
+        enum: [low, medium, high]
+        display: badge
+        color: orange

@@ -1,0 +1,84 @@
+[project]
+name = "assess-workbench"
+version = "0.1.0"
+description = "Multi-agent AI system for reviewing solution design documents"
+requires-python = ">=3.13"
+dependencies = [
+    "boto3>=1.42.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-mock>=3.12.0",
+    "pytest-asyncio>=0.23.0",
+    "requests>=2.31.0",
+    "websockets>=12.0",
+    "pyjwt[crypto]>=2.10.0",
+    "python-dotenv>=1.0.0",
+    "ruff>=0.15.8",
+    "pre-commit>=4.0.0",
+    "pydantic>=2.0.0",
+    "vulture>=2.16",
+    "radon>=6.0.1",
+    "pyyaml>=6.0.3",
+    "Pillow>=10.0.0",
+    "PyMuPDF>=1.25.0",
+]
+
+[dependency-groups]
+# Agent runtime dependencies. Every agent runs the same shared runtime
+# (agents/shared/{review,chat}_agent.py), parameterized by AGENT_TYPE, so the
+# dependency set is identical across all agents — hence one group, not one per
+# agent. These roots are exported to a per-agent requirements.txt at deploy time
+# by scripts/deploy_agent.sh (mirroring how agents/*/shared/ is assembled), and
+# pinned through uv.lock so the weekly grype scan can see the agent surface.
+# Keep in sync with what agents/shared/ imports.
+agents = [
+    "bedrock-agentcore",
+    "strands-agents[otel]>=1.35.0",
+    "aws-opentelemetry-distro>=0.10.0",
+    "pydantic>=2.0.0",
+    "boto3>=1.42.0",
+]
+# load_document Lambda dependencies (PDF text/image extraction). Exported from
+# uv.lock at build time by scripts/build_load_document.sh and installed
+# cross-compiled for the Lambda x86_64 runtime — so the deployed package matches
+# the versions uv.lock pins (and the weekly scan sees). Not committed as a
+# requirements.txt; the lock is the source of truth.
+load_document = [
+    "pymupdf>=1.25.0",
+    "Pillow>=10.0.0",
+]
+# Dependencies Lambda layer: boto3 (newer than the runtime's bundled version)
+# plus the JWT verification stack. Exported from uv.lock at build time by
+# scripts/build_dependencies_layer.sh. Declaring these here instead of
+# hardcoding them in the build script brings them — notably PyJWT, which
+# verifies Cognito JWTs — into uv.lock and therefore into the weekly scan.
+lambda_layer = [
+    "boto3>=1.42.0",
+    "pyjwt[crypto]>=2.10.0",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+markers = [
+    "unit: pure logic tests — no AWS, no mocks of AWS",
+    "live: tests against real deployed AWS infrastructure",
+    "integration: (legacy) alias for live tests",
+]
+asyncio_mode = "auto"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["api"]

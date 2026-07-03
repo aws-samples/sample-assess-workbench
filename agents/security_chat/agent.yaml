@@ -1,0 +1,8 @@
+name: security_chat
+role: chat
+ssm_key: agent/security_chat_arn
+model_id: global.anthropic.claude-haiku-4-5-20251001-v1:0
+tool_limits:
+  search_findings: 4
+  search_document: 3
+  lookup_standard: 2
