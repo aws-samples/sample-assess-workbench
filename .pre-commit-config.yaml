@@ -1,0 +1,114 @@
+# Developer pre-commit hooks — fast, local hygiene gating.
+#
+#   task precommit          run every hook against all files (what CI runs)
+#   task precommit:install  install the git hooks (pre-commit + pre-push)
+#
+# Stages:
+#   pre-commit — fast hooks (ruff, eslint, terraform fmt, stock hygiene,
+#                secrets) run on commit AND push (their default stages)
+#   pre-push   — additionally runs unit tests + tflint (too slow for commit)
+#
+# We don't set default_stages: the fast hooks keep their natural multi-stage
+# default (a push re-checks the pushed commits' files as a safety net), and we
+# only opt the slow checks INTO pre-push via `stages: [pre-push]`.
+#
+# The ruff hooks are `repo: local` calling `uv run ruff`, so they share the
+# single uv-pinned ruff version (uv.lock) with `task lint` — no version drift.
+# CI must `uv sync` before `pre-commit run` so `uv run ruff`/`pytest` resolve.
+#
+# No `exclude:` regex is needed: pre-commit only sees staged files, and every
+# generated/vendored path (.venv/, node_modules/, .build/, .bedrock_agentcore/,
+# .ash/, frontend/dist/, __pycache__/) is gitignored, so it can never be staged.
+minimum_pre_commit_version: "3.5.0"
+fail_fast: false
+
+repos:
+  - repo: local
+    hooks:
+      # ── Python (ruff) ──
+      - id: ruff-check
+        name: ruff check (lint)
+        entry: uv run ruff check --force-exclude
+        language: system
+        types_or: [python, pyi, jupyter]
+        require_serial: true
+      - id: ruff-format
+        name: ruff format
+        entry: uv run ruff format --force-exclude
+        language: system
+        types_or: [python, pyi, jupyter]
+        require_serial: true
+
+      # ── Frontend (eslint) ──
+      # Runs the project's eslint (flat config in frontend/) over src/, matching
+      # `task lint`. pass_filenames:false + files-trigger so it fires once when
+      # any frontend source file is staged rather than per-file.
+      - id: eslint
+        name: eslint (frontend)
+        entry: bash -c 'cd frontend && npx eslint src/'
+        language: system
+        files: ^frontend/src/.*\.(jsx?|tsx?)$
+        pass_filenames: false
+        require_serial: true
+
+      # ── Terraform (fmt) ──
+      # Mutating fmt (like ruff format): rewrites layout and re-stage is needed
+      # if it changes anything. Recursive over terraform/, triggered by any .tf.
+      - id: terraform-fmt
+        name: terraform fmt
+        entry: terraform fmt -recursive terraform/
+        language: system
+        files: \.tf$
+        pass_filenames: false
+        require_serial: true
+
+      # ── Environment-resolution guard (scripts) ──
+      # Scripts must resolve env via scripts/utils/with-env.sh — never hand-roll
+      # `source .env` or default the tenant knobs. See the with-env.sh header.
+      - id: env-resolution
+        name: env resolution (with-env.sh only)
+        entry: scripts/utils/check_env_resolution.sh
+        language: system
+        files: ^scripts/.*\.sh$
+        require_serial: true
+
+      # ── pre-push: slower checks before code leaves the machine ──
+      - id: pytest-unit
+        name: pytest (unit)
+        entry: uv run pytest tests/unit -q
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]
+        require_serial: true
+      - id: tflint
+        name: tflint
+        entry: bash -c 'cd terraform && tflint --recursive --config "$(pwd)/.tflint.hcl"'
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]
+        require_serial: true
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      # ruff format already covers trailing-whitespace/EOF for .py; these two
+      # cover the non-Python surface (md, sh, yaml, tf, ts) that ruff ignores.
+      - id: trailing-whitespace
+        args: [--markdown-linebreak-ext=md]  # preserve Markdown hard breaks
+      - id: end-of-file-fixer
+      - id: check-merge-conflict
+
+  # Secret detection — stop a credential before it lands in history. Runs
+  # baseline-less (zero findings in-tree); blocks on any real new secret.
+  - repo: https://github.com/Yelp/detect-secrets
+    rev: v1.5.0
+    hooks:
+      - id: detect-secrets
+
+  # Shell linting (scripts/**/*.sh). Config in .shellcheckrc, so no args needed.
+  - repo: https://github.com/shellcheck-py/shellcheck-py
+    rev: v0.11.0.1
+    hooks:
+      - id: shellcheck

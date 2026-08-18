@@ -1,0 +1,28 @@
+{
+  "metadataAttributes": {
+    "standard_id": {
+      "value": {
+        "type": "STRING",
+        "stringValue": "acme-information-security-policy"
+      }
+    },
+    "source_type": {
+      "value": {
+        "type": "STRING",
+        "stringValue": "organisational_policy"
+      }
+    },
+    "jurisdiction": {
+      "value": {
+        "type": "STRING",
+        "stringValue": "international"
+      }
+    },
+    "industry": {
+      "value": {
+        "type": "STRING",
+        "stringValue": "general"
+      }
+    }
+  }
+}

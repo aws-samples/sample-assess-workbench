@@ -1,0 +1,89 @@
+Solution Design Document: E-Commerce Platform Modernization
+
+1. OVERVIEW
+
+This document outlines the architecture for modernizing our legacy e-commerce platform. The new system will handle 10,000 concurrent users and process 1 million transactions per day.
+
+2. ARCHITECTURE
+
+2.1 System Architecture
+
+The system uses a monolithic architecture with a single PostgreSQL database. All application logic runs in a single Java application server.
+
+Components:
+- Web Application (Java Spring Boot)
+- Database (PostgreSQL 12)
+- File Storage (Local filesystem)
+- Cache (In-memory HashMap)
+
+2.2 Data Flow
+
+1. User requests hit the application server directly
+2. Application queries the database for every request
+3. Files are stored on the application server's local disk
+4. Session data is stored in the database
+
+3. DATABASE DESIGN
+
+Single PostgreSQL instance handles:
+- User data
+- Product catalog
+- Orders and transactions
+- Session storage
+- Audit logs
+
+All tables are in a single database with no partitioning or sharding strategy.
+
+4. SECURITY
+
+4.1 Authentication
+- Username and password stored in database
+- Passwords are MD5 hashed
+- No multi-factor authentication
+- Session tokens stored in cookies without HttpOnly flag
+
+4.2 Authorization
+- Role-based access control implemented in application code
+- Admin credentials hardcoded in configuration file
+
+4.3 Data Protection
+- Database connections use plain text (no SSL)
+- API endpoints use HTTP (no HTTPS)
+- Credit card data stored in database without encryption
+
+5. DEPLOYMENT
+
+5.1 Infrastructure
+- Single EC2 instance (t2.large)
+- No load balancer
+- No auto-scaling
+- Manual deployment process
+
+5.2 Monitoring
+- Basic CloudWatch metrics
+- No application-level monitoring
+- No distributed tracing
+- Logs stored locally on server
+
+6. DISASTER RECOVERY
+
+- Database backups run weekly
+- No backup testing process
+- No documented recovery procedures
+- RTO: Unknown, RPO: 7 days
+
+7. SCALABILITY PLAN
+
+Current plan is to upgrade to a larger EC2 instance (vertical scaling) when performance degrades.
+
+8. DEPENDENCIES
+
+- Payment processing via third-party API (no fallback)
+- Email service (single provider, no retry logic)
+- External inventory system (synchronous calls)
+
+9. FUTURE CONSIDERATIONS
+
+- May need to add caching "at some point"
+- Consider microservices "if we grow"
+- Look into Kubernetes "eventually"

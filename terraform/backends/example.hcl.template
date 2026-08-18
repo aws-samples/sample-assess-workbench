@@ -1,0 +1,17 @@
+# Terraform S3 backend configuration — TEMPLATE.
+#
+# You normally do not edit this by hand. `task deploy:tf-bootstrap` (the bootstrap
+# script) derives your account from STS and generates `backends/<env>.hcl` from
+# this template, substituting <PROJECT_NAME>, <ACCOUNT_ID>, and <AWS_REGION>.
+#
+# The generated `<env>.hcl` files are account-specific (the bucket name embeds
+# your account ID) and are gitignored — only this template is tracked. Account
+# targeting comes from AWS_PROFILE, not from this file. The deploy tasks select
+# the file by environment: -backend-config=backends/${ENVIRONMENT}.hcl.
+# See SETUP.md for the full bootstrap process.
+
+bucket         = "<PROJECT_NAME>-terraform-state-<ACCOUNT_ID>"
+key            = "infrastructure/terraform.tfstate"
+region         = "<AWS_REGION>"
+encrypt        = true
+dynamodb_table = "<PROJECT_NAME>-terraform-locks"
